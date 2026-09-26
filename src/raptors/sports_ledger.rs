@@ -231,6 +231,34 @@ fn parse_time(s: &str) -> Option<DateTime<Utc>> {
         .or_else(|| DateTime::parse_from_str(&format!("{s}00"), "%Y-%m-%d %H:%M:%S%z").ok().map(|t| t.with_timezone(&Utc)))
 }
 
+/// A catalog for a venue whose adapter is not written yet.
+///
+/// Answers nothing, so the ledger runs and reports zero coverage rather than the
+/// raptor being absent on that venue. An empty answer that is visible in the
+/// telemetry is a better state than a missing feature: the operator can see that
+/// sports is unsupported here instead of wondering why nothing ever matches.
+pub struct NoSportsCatalog;
+
+#[async_trait::async_trait]
+impl SportsCatalog for NoSportsCatalog {
+    async fn games(
+        &self, _http: &reqwest::Client, _api_key: &str,
+        _leagues: &[(String, String)], _now: DateTime<Utc>,
+    ) -> (Vec<MatchedGame>, Option<i64>) {
+        (Vec::new(), None)
+    }
+    async fn best_levels(
+        &self, _http: &reqwest::Client, _leg_id: &str,
+    ) -> (Option<f64>, Option<f64>, Option<f64>, Option<f64>) {
+        (None, None, None, None)
+    }
+    async fn settled_prices(
+        &self, _http: &reqwest::Client, _market_key: &str, _legs: &[String],
+    ) -> HashMap<String, f64> {
+        HashMap::new()
+    }
+}
+
 /// Polymarket International's catalog: Gamma for the games and the resolutions,
 /// the CLOB for the touch.
 ///
@@ -393,6 +421,27 @@ pub struct OddsEvent {
     pub home: String,
     pub away: String,
     pub commence: DateTime<Utc>,
+}
+
+/// The Odds API's event list for one sport, and the credits it reported remaining.
+///
+/// `/events` is free — it does not count against the quota — but still returns the
+/// quota headers, which is why every caller threads the remaining count through.
+/// Shared so a venue catalog adapter fetches the bookmaker slate exactly the way
+/// the intl one does; the Odds API half of this module is venue-neutral and there
+/// is no reason for a second copy of it to drift.
+pub async fn odds_events_for_sport(
+    http: &reqwest::Client,
+    api_key: &str,
+    sport_key: &str,
+) -> (Vec<OddsEvent>, Option<i64>) {
+    match get_json(http, &format!("{ODDS}/sports/{sport_key}/events"), Some(api_key), &[]).await {
+        Ok((v, remaining, _)) => (parse_odds_events(&v), remaining),
+        Err(e) => {
+            debug!("🏈 Sports ledger: Odds API events for '{sport_key}' failed: {e}");
+            (Vec::new(), None)
+        }
+    }
 }
 
 pub fn parse_odds_events(events: &Value) -> Vec<OddsEvent> {
@@ -1044,6 +1093,7 @@ async fn fetch_odds(
 
 async fn build_snapshot_rows(
     http: &reqwest::Client,
+    catalog: &dyn SportsCatalog,
     odds: &Value,
     odds_time: DateTime<Utc>,
     sport_key: &str,
@@ -1063,10 +1113,8 @@ async fn build_snapshot_rows(
         let books = by_id.get(g.odds_event_id.as_str()).and_then(|e| e.get("bookmakers")).and_then(Value::as_array);
         for o in &g.outcomes {
             let c = consensus_for(books, &o.odds_name, odds_time);
-            let (pm_bid, pm_bid_size, pm_ask, pm_ask_size) = match get_json(http, CLOB_BOOK, None, &[("token_id", o.pm.token_id.as_str())]).await {
-                Ok((b, _, _)) => best_levels(&b),
-                Err(_) => (None, None, None, None),
-            };
+            let (pm_bid, pm_bid_size, pm_ask, pm_ask_size) =
+                catalog.best_levels(http, o.pm.token_id.as_str()).await;
             // Per outcome, because the book read above is one of many and the
             // last one of a pass can be minutes after the first.
             let pm_at = Utc::now().to_rfc3339();
@@ -1173,7 +1221,12 @@ pub async fn settled_prices_for_market(
 
 /// Record the resolution of every ledger market whose game started at least
 /// `RESULT_AFTER_START_SECS` ago and is now closed with a 0/1 price.
-async fn capture_results(http: &reqwest::Client, pool: &sqlx::SqlitePool, now: DateTime<Utc>) {
+async fn capture_results(
+    http: &reqwest::Client,
+    catalog: &dyn SportsCatalog,
+    pool: &sqlx::SqlitePool,
+    now: DateTime<Utc>,
+) {
     let started_before = (now - ChronoDuration::seconds(RESULT_AFTER_START_SECS)).to_rfc3339();
     let started_after = (now - ChronoDuration::seconds(RESULT_GIVE_UP_SECS)).to_rfc3339();
     // Oldest game first, so every pending market is reached within a few passes.
@@ -1187,14 +1240,14 @@ async fn capture_results(http: &reqwest::Client, pool: &sqlx::SqlitePool, now: D
     let mut recorded = 0;
     for cid in order.into_iter().take(RESULTS_PER_PASS) {
         let tokens = by_cid.remove(&cid).unwrap_or_default();
-        // Gamma hides closed markets unless asked: without `closed=true` a
-        // finished game's market comes back as an empty list, so no result was
-        // ever recorded (0 from 919 ledger rows by 2026-09-12). Only a closed
-        // market can carry a result, so asking for closed ones alone loses nothing.
-        let Ok((v, _, _)) = get_json(http, &format!("{GAMMA}/markets"), None, &[("condition_ids", cid.as_str()), ("closed", "true")]).await else { continue };
-        let Some(m) = v.as_array().and_then(|a| a.first()) else { continue };
+        // Through the catalog, because only the venue knows where its own
+        // settlement record lives: Gamma's closed-markets listing on Polymarket
+        // International, the exchange's own `result` field on Kalshi, the gateway's
+        // pinned side price on Polymarket US. Each answers decisively or not at all.
+        let legs: Vec<String> = tokens.iter().map(|(t, _)| t.clone()).collect();
+        let settled = catalog.settled_prices(http, &cid, &legs).await;
         for (token, label) in tokens {
-            if let Some(price) = resolved_price(m, &token) {
+            if let Some(price) = settled.get(&token).copied() {
                 db::record_sports_line_result(pool, &cid, &token, &label, price).await;
                 recorded += 1;
             }
@@ -1225,6 +1278,9 @@ struct LedgerState {
 
 pub async fn run_sports_ledger(
     http: Arc<reqwest::Client>,
+    // The venue's own catalog. Built in `venues::sports_catalog()` under the cfg
+    // guards, so this module stays free of them.
+    catalog: Arc<dyn SportsCatalog>,
     mut config_rx: watch::Receiver<Arc<DynamicConfig>>,
     raptor_health_tx: Arc<watch::Sender<HashMap<String, crate::api::server::AssetRaptorHealth>>>,
 ) {
@@ -1247,7 +1303,7 @@ pub async fn run_sports_ledger(
         }
         if cfg.sports_ledger_enabled {
             match std::env::var(config::SPORTS_ODDS_KEY_ENV).ok().filter(|k| !k.is_empty()) {
-                Some(key) => tick(&http, &key, &cfg, &mut st, &raptor_health_tx).await,
+                Some(key) => tick(&http, &catalog, &key, &cfg, &mut st, &raptor_health_tx).await,
                 None if !st.warned_no_key => {
                     warn!("🏈 Sports ledger enabled but {} is not set — nothing to record", config::SPORTS_ODDS_KEY_ENV);
                     st.warned_no_key = true;
@@ -1275,6 +1331,7 @@ pub async fn run_sports_ledger(
 
 async fn tick(
     http: &reqwest::Client,
+    catalog: &Arc<dyn SportsCatalog>,
     api_key: &str,
     cfg: &DynamicConfig,
     st: &mut LedgerState,
@@ -1308,7 +1365,7 @@ async fn tick(
     }
     if st.catalog_at.map_or(true, |t| (now - t).num_seconds() >= CATALOG_REFRESH_SECS) {
         let leagues = parse_leagues(&cfg.sports_ledger_leagues);
-        let (games, remaining) = refresh_catalog(http, api_key, &leagues, now).await;
+        let (games, remaining) = catalog.games(http, api_key, &leagues, now).await;
         info!("🏈 Sports ledger: {} matched game(s) across {} league(s) | Odds API credits remaining {}",
               games.len(), leagues.len(), remaining.map_or("?".to_string(), |r| r.to_string()));
         st.games = games;
@@ -1377,7 +1434,7 @@ async fn tick(
                     ).await;
                 }
                 let (rows, book_rows) =
-                    build_snapshot_rows(http, &odds, odds_time, &sport_key, &st.games, now, st.remaining).await;
+                    build_snapshot_rows(http, catalog.as_ref(), &odds, odds_time, &sport_key, &st.games, now, st.remaining).await;
                 let n_games = rows.iter().map(|r| r.odds_event_id.as_str()).collect::<HashSet<_>>().len();
                 // The board is what squadrons read; the rows are what the research
                 // reads. Both come from this one paid call.
@@ -1402,7 +1459,7 @@ async fn tick(
     if st.results_at.map_or(true, |t| (now - t).num_seconds() >= RESULTS_REFRESH_SECS) {
         st.results_at = Some(now);
         if let Some(pool) = db::pool() {
-            capture_results(http, pool, now).await;
+            capture_results(http, catalog.as_ref(), pool, now).await;
         }
     }
 }
@@ -1891,7 +1948,9 @@ mod live_gamma_tests {
             row("29514720079430880907153855961681340086780539591746523903213318866605387663992", "Detroit Tigers"),
         ]).await;
         let now = parse_time("2026-09-12T13:00:00Z").unwrap();
-        capture_results(&reqwest::Client::new(), &pool, now).await;
+        // Against the live venue through its own catalog, which is what production
+        // uses; the seam must not change what this test exercises.
+        capture_results(&reqwest::Client::new(), &IntlSportsCatalog, &pool, now).await;
         let prices: Vec<f64> = sqlx::query_scalar("SELECT resolved_price FROM sports_line_results ORDER BY outcome_label")
             .fetch_all(&pool).await.unwrap();
         assert_eq!(prices.len(), 2, "both outcomes of a finished game resolve");

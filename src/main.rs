@@ -549,7 +549,8 @@ async fn run() -> Result<()> {
         let cfg = config_rx.clone();
         let health = Arc::clone(&raptor_health_tx);
         spawn_supervised("sports-ledger", move || {
-            dradis::raptors::sports_ledger::run_sports_ledger(Arc::clone(&http), cfg.clone(), Arc::clone(&health))
+            dradis::raptors::sports_ledger::run_sports_ledger(
+                Arc::clone(&http), dradis::venues::sports_catalog(), cfg.clone(), Arc::clone(&health))
         });
     }
     let (tennis_tx, tennis_rx) =

@@ -217,6 +217,55 @@ pub fn min_order_shares() -> Decimal { dec!(1) }
 #[cfg(feature = "us_retail")]
 pub fn min_order_shares() -> Decimal { dec!(1) }
 
+/// The venue's own sports catalog for the line ledger.
+///
+/// The one place that knows which venue's game markets, order book and settlement
+/// record the ledger should read. `raptors::sports_ledger` holds the trait and every
+/// venue-neutral part of the pipeline — the Odds API polling, the de-vig, the game
+/// matcher, the credit budget, the board — and stays free of `cfg` guards, which is
+/// where the architecture puts them.
+///
+/// One implementation is live per process: the engine builds a separate binary per
+/// venue feature, so a running ledger only ever holds one venue's identifiers. That
+/// is why the board needs no venue column and no partitioning.
+#[cfg(feature = "intl_clob")]
+pub fn sports_catalog() -> std::sync::Arc<dyn crate::raptors::sports_ledger::SportsCatalog> {
+    std::sync::Arc::new(crate::raptors::sports_ledger::IntlSportsCatalog)
+}
+
+/// Kalshi's game series, order book and settlement record.
+///
+/// Builds its own client from the environment rather than borrowing the trading
+/// venue, because the ledger starts before the trading venue is connected. Without
+/// credentials there is no catalog and the ledger reports zero coverage, which is
+/// the honest state rather than a silent absence.
+#[cfg(feature = "kalshi")]
+pub fn sports_catalog() -> std::sync::Arc<dyn crate::raptors::sports_ledger::SportsCatalog> {
+    match crate::venues::kalshi::KalshiVenue::from_env() {
+        Ok(v) => std::sync::Arc::new(crate::venues::kalshi::sports::KalshiSportsCatalog {
+            venue: std::sync::Arc::new(v),
+        }),
+        Err(e) => {
+            tracing::warn!("🏈 Kalshi sports catalog unavailable ({e:#}) — the ledger will record nothing");
+            std::sync::Arc::new(crate::raptors::sports_ledger::NoSportsCatalog)
+        }
+    }
+}
+
+/// Polymarket US has no catalog adapter yet, so its ledger records nothing and
+/// every sports consumer idles with "no bookmaker line".
+///
+/// Deliberately an empty catalog rather than a missing one: the ledger runs, the
+/// telemetry reports zero coverage, and the gap is visible instead of the raptor
+/// simply not existing on this venue. Its discovery and settlement both need the
+/// SIGNED gateway client, and one detail is still unverified — which leg of a
+/// moneyline is `long`, and whether the market record names the team — which is why
+/// it is not guessed at here.
+#[cfg(feature = "us_retail")]
+pub fn sports_catalog() -> std::sync::Arc<dyn crate::raptors::sports_ledger::SportsCatalog> {
+    std::sync::Arc::new(crate::raptors::sports_ledger::NoSportsCatalog)
+}
+
 /// The price grid the venue's sports game markets quote on.
 ///
 /// Distinct from `helpers::price`'s hard-coded cent grid, which is the crypto

@@ -33,6 +33,7 @@
 
 pub mod auth;
 pub mod orders;
+pub mod sports;
 pub mod trader;
 pub mod types;
 pub mod ws;
