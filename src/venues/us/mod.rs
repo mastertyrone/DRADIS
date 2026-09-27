@@ -251,6 +251,62 @@ impl UsRetailVenue {
         categories: &[&str],
         min_volume: Option<f64>,
     ) -> Result<Vec<markets::UsMarketPair>> {
+        let all_markets = self.list_sports_category_markets(categories, min_volume).await?;
+        let raw_total = all_markets.len();
+
+        // Category census — one line showing the gateway's actual taxonomy, so
+        // a category filter that the server ignores (or names differently) is
+        // immediately visible in the logs instead of silently returning the
+        // wrong domain.
+        {
+            let mut census: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+            for m in &all_markets {
+                let key = if m.category.is_empty() { "(empty)" } else { m.category.as_str() };
+                *census.entry(key).or_default() += 1;
+            }
+            let mut counts: Vec<_> = census.into_iter().collect();
+            counts.sort_by(|a, b| b.1.cmp(&a.1));
+            let summary: Vec<String> = counts.iter().take(12)
+                .map(|(c, n)| format!("{c}={n}"))
+                .collect();
+            info!("US market discovery: categories seen: {}", summary.join(", "));
+            if !categories.is_empty() {
+                let requested: Vec<String> = categories.iter().map(|c| c.to_lowercase()).collect();
+                let foreign = all_markets.iter()
+                    .filter(|m| !requested.contains(&m.category.to_lowercase()))
+                    .count();
+                if foreign > 0 {
+                    tracing::warn!(
+                        "US market discovery: requested categories {categories:?} but {foreign}/{raw_total} \
+                         markets came back with other categories — gateway may ignore the filter"
+                    );
+                }
+            }
+        }
+
+        let pairs = markets::pair_markets(all_markets);
+        info!(
+            "US market discovery: {raw_total} raw markets → {} tradeable pairs",
+            pairs.len()
+        );
+        Ok(pairs)
+    }
+
+    /// Every market the gateway lists for `categories`, as parsed records.
+    ///
+    /// Extracted from [`Self::discover_binary_markets_filtered`] so the sports
+    /// catalog can reach the SAME listing rather than issuing a second, simpler
+    /// `/v1/markets` query of its own. That second query is what shipped first, and
+    /// it returned nothing usable: without this one's date window and `orderBy`, page
+    /// one of an unfiltered sports listing is dominated by already-settled events, so
+    /// the catalog reported "no Polymarket US moneylines" for every league while the
+    /// trading wing was finding 46 of them. It also never checked the HTTP status, so
+    /// an auth failure would have read as an empty slate too.
+    pub(crate) async fn list_sports_category_markets(
+        &self,
+        categories: &[&str],
+        min_volume: Option<f64>,
+    ) -> Result<Vec<types::UsMarket>> {
         const PAGE_LIMIT: usize = 200;
         const MAX_PAGES: usize = 20; // safety cap — the API may cycle
         let path = "/v1/markets";
@@ -357,44 +413,7 @@ impl UsRetailVenue {
             page += 1;
         }
 
-        let raw_total = all_markets.len();
-
-        // Category census — one line showing the gateway's actual taxonomy, so
-        // a category filter that the server ignores (or names differently) is
-        // immediately visible in the logs instead of silently returning the
-        // wrong domain.
-        {
-            let mut census: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-            for m in &all_markets {
-                let key = if m.category.is_empty() { "(empty)" } else { m.category.as_str() };
-                *census.entry(key).or_default() += 1;
-            }
-            let mut counts: Vec<_> = census.into_iter().collect();
-            counts.sort_by(|a, b| b.1.cmp(&a.1));
-            let summary: Vec<String> = counts.iter().take(12)
-                .map(|(c, n)| format!("{c}={n}"))
-                .collect();
-            info!("US market discovery: categories seen: {}", summary.join(", "));
-            if !categories.is_empty() {
-                let requested: Vec<String> = categories.iter().map(|c| c.to_lowercase()).collect();
-                let foreign = all_markets.iter()
-                    .filter(|m| !requested.contains(&m.category.to_lowercase()))
-                    .count();
-                if foreign > 0 {
-                    tracing::warn!(
-                        "US market discovery: requested categories {categories:?} but {foreign}/{raw_total} \
-                         markets came back with other categories — gateway may ignore the filter"
-                    );
-                }
-            }
-        }
-
-        let pairs = markets::pair_markets(all_markets);
-        info!(
-            "US market discovery: {raw_total} raw markets across {page} page(s) → {} tradeable pairs",
-            pairs.len()
-        );
-        Ok(pairs)
+        Ok(all_markets)
     }
 
     /// What the venue says `leg_symbol` settled at, if its market settled.

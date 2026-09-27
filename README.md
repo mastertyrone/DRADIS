@@ -1,6 +1,6 @@
 # DRADIS
 
-> **Direct Reaction And Dynamic Intelligence System** — Low-latency Rust prediction-market trading bot for Kalshi & Polymarket. Nine autonomous Viper strategies, a Raptor recon layer (Price, Funding, Derivatives, Tide "Institutional Pulse", Horizon "TradFi Velocity", a Sports book-consensus scout, and a venue-neutral Tennis event-state scout), a Squadron deployment framework, a CAG async dispatch layer with concurrent multi-asset support, a real-time Next.js Control Tower, and an LLM Advisor (Ollama local/remote, OpenAI-compatible, or Anthropic) that delivers optimization recommendations via Telegram & OpenClaw — and can propose or autonomously apply live config changes under a tiered, guard-railed autonomy policy.
+> **Direct Reaction And Dynamic Intelligence System** — Low-latency Rust prediction-market trading bot for Kalshi & Polymarket. Ten autonomous Viper strategies, a Raptor recon layer (Price, Funding, Derivatives, Tide "Institutional Pulse", Horizon "TradFi Velocity", a Sports book-consensus scout, and a venue-neutral Tennis event-state scout), a Squadron deployment framework, a CAG async dispatch layer with concurrent multi-asset support, a real-time Next.js Control Tower, and an LLM Advisor (Ollama local/remote, OpenAI-compatible, or Anthropic) that delivers optimization recommendations via Telegram & OpenClaw — and can propose or autonomously apply live config changes under a tiered, guard-railed autonomy policy.
 
 ![Rust](https://img.shields.io/badge/Rust-1.95+-orange?logo=rust&logoColor=white)
 ![Tokio](https://img.shields.io/badge/Tokio-async%20runtime-darkgreen?logo=rust&logoColor=white)
@@ -21,7 +21,7 @@ Public Demo Site: https://demo.dradis.live/
 ## Two ways to run it
 
 **From source — this repository**
-Clone, pick a risk profile, run it with Docker. The full engine, all nine
+Clone, pick a risk profile, run it with Docker. The full engine, all ten
 strategies and the Control Tower are here; nothing is held back for the paid
 image. **AGPL v3** — see [LICENSE](LICENSE).
 
@@ -162,7 +162,7 @@ ASSETS=us                          # keep the dashboard pool tidy (US data lives
 > reconcile via `OrderLifecycle`. Open positions and portfolio P&L appear in the Control Tower under the **`us`**
 > asset selector. The Control Tower API stays live on `:9000` regardless. A second
 > **crypto wing** (`us-crypto` asset) hunts crypto-class markets with the full Raptor
-> stack, so all nine Vipers fly on them.
+> stack, so all nine crypto Vipers fly on them.
 
 ### Kalshi configuration (`.env`)
 
@@ -186,7 +186,7 @@ ASSETS=kalshi                            # keep the dashboard pool tidy (data in
 > **Kalshi status:** the loop (`src/venues/kalshi/trader.rs`) is **crypto-first** —
 > it discovers the hottest open market across the configured series (15-minute and
 > hourly BTC/ETH by default), classifies it via the shared taxonomy, and flies **all
-> nine Vipers** with the full Raptor intelligence stack. Order books stream over the
+> nine crypto Vipers** with the full Raptor intelligence stack. Order books stream over the
 > authenticated WebSocket (`orderbook_delta` with sequence-gap recovery) and fills
 > confirm event-precisely via the private `fill` channel. Kalshi's quadratic taker
 > fee (max 1.75¢/contract at P=0.50) is priced into Viper edge thresholds. Positions
@@ -378,7 +378,7 @@ Raptors are intentionally dumb: **fetch, normalize, broadcast** — no trading l
 | **Derivatives Raptor**         | Binance Perpetuals FAPI | Open-interest delta + taker CVD ratio (positioning pressure, all-asset) | `src/raptors/derivatives.rs` |
 | **Tide Raptor**                | Alpaca IEX + synthetic iNAV | "Institutional Pulse" + coherence from spot-BTC-ETF (IBIT/FBTC/ARKB) premium vs iNAV — BTC-only, US-hours | `src/raptors/tide.rs` |
 | **Horizon Raptor**             | Alpaca IEX (shared)     | TradFi velocity (SPY/QQQ), macro coherence (BTC↔QQQ), VIX proxy (UVXY) — BTC-only, US-hours | `src/raptors/horizon.rs` |
-| **Sports Raptor**              | The Odds API (h2h)      | Vig-free cross-book consensus, drift and dispersion per matched moneyline, keyed by outcome token — Polymarket Intl, **recording only** | `src/raptors/sports_ledger.rs` |
+| **Sports Raptor**              | The Odds API (h2h)      | Vig-free cross-book consensus, drift and dispersion per matched moneyline, keyed by outcome token — all three venues; read by **Bookline** | `src/raptors/sports_ledger.rs` |
 | **Tennis Raptor**              | Live Tennis API (REST)  | Live tennis event state: score, serving side, break-point flag, feed staleness — venue-neutral, **observe-only** | `src/raptors/tennis.rs` |
 | *(future)* **Politics Raptor** | Polling aggregators     | Approval drift, event probability shifts                | —                        |
 
@@ -386,7 +386,7 @@ When multiple Raptors are active, Basis, Momentum and TrendCapture use them as c
 
 The **Tide** and **Horizon** Raptors share a single Alpaca IEX WebSocket connection (free tier allows only one per account). Tide tracks BTC-specific institutional flow (ETF premium); Horizon tracks TradFi macro regime (equity velocity, VIX). Together they enable divergence detection — e.g., equities selling off but BTC ETFs at premium suggests institutional flight *into* crypto.
 
-The **Sports Raptor** is the first non-crypto scout. It matches each Polymarket International sports moneyline to a bookmaker event, reduces that event's cross-book h2h odds to a vig-free consensus, and publishes one line per outcome token, so a squadron reads its own game rather than whichever game happens to be next. Every snapshot is recorded with the raw per-book prices behind it, so the history can be re-analyzed rather than taken on trust. It runs **recording only** — no Viper consumes it for sizing yet — and stays idle without `ODDS_API_KEY`.
+The **Sports Raptor** is the first non-crypto scout. It matches each venue's sports moneyline to a bookmaker event, reduces that event's cross-book h2h odds to a vig-free consensus, and publishes one line per outcome token, so a squadron reads its own game rather than whichever game happens to be next. Matching is per-venue behind one `SportsCatalog` seam, so the same board serves Polymarket International (Gamma token ids), Kalshi (game-series tickers, with kick-off recovered from the ticker or its expiration) and Polymarket US (signed moneyline records). Every snapshot is recorded with the raw per-book prices behind it, so the history can be re-analyzed rather than taken on trust. Snapshots are taken on a schedule relative to kick-off (`SPORTS_LEDGER_SNAPSHOT_OFFSETS_MINS`), tightening as the game approaches, and the raptor stays idle without `ODDS_API_KEY`. One Viper reads it: **Bookline**.
 
 The **Tennis Raptor** reads the event itself rather than the betting line: it polls the Live Tennis API's live-match endpoint (keyed on `LIVETENNIS_API_KEY`), tracks one live match (sticky by id, otherwise the freshest score), and broadcasts sets/games/points, the serving side, and a derived break-point flag (receiver at AD, or receiver at 40 vs a server below 40 — never in tiebreaks). Feed health follows the same stale-feed-reads-as-disconnected rule as the other scouts: a score older than `TENNIS_SCORE_STALENESS_SECS` reports `tennis_connected = false` alongside its age, so a consumer widens or pulls, never holds. Honest tier facts: the free tier is 30 req/min / 100 req/day — the default `TENNIS_POLL_SECS = 900` fits all-day polling inside the free cap, while ~60s polling gives near point-level tracking for only ~100 minutes/day (develop-and-test, or following a few matches; sustained fast polling needs a paid tier). The provider's push WebSocket and model win-probability fields are top-tier features and are **not** used — this raptor is free-tier REST only, observe-only, and degrades silently to a neutral snapshot without a key.
 
@@ -394,7 +394,7 @@ The **Tennis Raptor** reads the event itself rather than the betting line: it po
 
 ## ✈️ Viper Wing (`src/vipers/`)
 
-Nine specialized Viper strategy classes. Each Viper is an autonomous tactical unit with its own capital budget, position book, and entry/exit logic.
+Ten specialized Viper strategy classes. Each Viper is an autonomous tactical unit with its own capital budget, position book, and entry/exit logic.
 
 | Viper            | Venue        | Description                                                                                                                                                                               |
 |------------------|--------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
@@ -407,6 +407,17 @@ Nine specialized Viper strategy classes. Each Viper is an autonomous tactical un
 | **TrendCapture** | Window/Daily | Exploits sustained multi-minute oracle drift (10m + 60m) before Polymarket reprices; Kelly-fractional sizing, OBI veto, trend-reversal exit                                               |
 | **FairValue**    | Window/Daily | Compare fair value of asset, compare market ask, enter when discount exceeds margin                                                                                                       |
 | **Convergence**  | Hourly       | Macro-conviction directional Viper — opens YES/NO only when the Tide institutional pulse, Derivatives CVD, and OI all agree on a direction. BTC-only, US-cash-hours-only, fixed tiny size |
+| **Bookline** *(trial)* | Sports game | Sports moneylines, maker-first: rests a bid under the vig-free bookmaker consensus and holds to fee-free settlement. Pulls on adverse line movement or approaching kick-off. **Simulated** — it keeps its own ledger and places no venue order (see below) |
+
+### Bookline — the sports Viper, and what "trial" means here
+
+**Bookline** is the first Viper that trades something other than crypto. The thesis is narrow on purpose: a vig-free consensus across many bookmakers is a sharper estimate of a game's outcome than a prediction market's thin moneyline book, so a bid resting a few points under that consensus is a bet on the books being right rather than a directional view on the game. It quotes the favorite side only, because de-vigging systematically overstates longshots and a record built on cheap outcomes would measure that artifact instead of the bookmakers' information.
+
+It is maker-first and deliberately timid. It refuses to quote at all unless enough books agree, their dispersion is tight, the consensus is above the favorite floor, and kick-off is still far enough off; it pulls a resting bid the moment the consensus moves against it, since a cancel is free and the asymmetry between an unfilled pull and an adversely-selected fill is the entire reason the strategy can work. The required edge tapers as kick-off approaches and widens when the line is moving. Held to settlement, the exit is fee-free on Polymarket International, so the take-profit and the settle-time decision are priced with each venue's own maker fee — including Polymarket US, where that fee is a rebate and therefore negative.
+
+Two staleness thresholds govern the feed, and the distinction matters: **Max Feed Age To Quote** is how old a consensus may be for Bookline to *place* a bid, while **Max Feed Age To Hold** is how old it may get before an *already-resting* bid is withdrawn. The second is much looser than the first, because committing new capital demands a current line whereas a bid already resting at a price that was current when placed is not made wrong by the feed going quiet. Sharing one threshold capped a quote's life at the entry bar, which is far too short for a passive maker to be crossed. Keep the hold threshold comfortably above the widest gap in the snapshot schedule.
+
+**Status: simulated, and unproven.** Bookline is instantiated and evaluated on every venue like the other nine, and it runs live on real markets rather than behind instance-wide ghost mode — but it places no venue order. It keeps its own ledger (`bookline_shadow`) recording each quote, pull, fill and settlement so the strategy accumulates a real record against real books before any capital is committed. The venue-matching layer is implemented for all three venues; at the time of writing the Polymarket US path has not yet been exercised against the live gateway, and no settled Bookline record exists on any venue. Treat the numbers it produces as a trial in progress, not as a track record. It is off by default (`BOOKLINE_ENABLED`) and every threshold above is a live `DynamicConfig` knob on the Bookline card in Control Tower.
 
 Build your own: [CUSTOM_STRATEGY.md](docs/CUSTOM_STRATEGY.md).
 
@@ -430,8 +441,8 @@ Markets are classified into domains that determine which Raptors and Vipers are 
 
 | Market Class | Raptors | Vipers |
 |--------------|---------|--------|
-| `crypto` | Price, Funding, Derivatives, Tide | All nine Vipers |
-| `sports` | Sports (cross-book consensus) | Arbitrage, Maker (venue-agnostic) |
+| `crypto` | Price, Funding, Derivatives, Tide | All nine crypto Vipers |
+| `sports` | Sports (cross-book consensus) | Bookline, Arbitrage, Maker (venue-agnostic) |
 | `politics` | Politics (roadmap) | Arbitrage, Maker (venue-agnostic) |
 
 Classification is data-driven via the `market_class_rule` table — add a new mapping (e.g., `tennis → sports`) with one INSERT, no code change.
@@ -440,7 +451,7 @@ Classification is data-driven via the `market_class_rule` table — add a new ma
 
 | Preset          | Raptors         | Vipers                             |
 |-----------------|-----------------|------------------------------------|
-| `full_wing`     | Price + Funding + Derivatives + Tide | All nine Vipers (current default) |
+| `full_wing`     | Price + Funding + Derivatives + Tide | All nine crypto Vipers (current default) |
 | `momentum_only` | Price only      | Momentum + GBoost                  |
 | `arb_wing`      | Price + Funding | Arbitrage + Basis                  |
 
@@ -514,7 +525,7 @@ DRADIS ships with a real-time web dashboard called **Control Tower** built on Ne
 
 Every parameter in the Viper cards maps directly to the runtime `DynamicConfig`. Editing a value sends `PATCH /api/config` — **no restart required**. Changes take effect on the next 50ms tick.
 
-> **Hot-Enable Design** — All nine Vipers are always instantiated at startup. The `DynamicConfig` enable flags are the sole runtime gate. Toggle any Viper on or off during a live session with immediate effect.
+> **Hot-Enable Design** — All ten Vipers are always instantiated at startup. The `DynamicConfig` enable flags are the sole runtime gate. Toggle any Viper on or off during a live session with immediate effect.
 
 ### Setup Tab — No-Shell Credential Management
 
@@ -799,8 +810,8 @@ POLYGON_RPC_URL=https://polygon-mainnet.g.alchemy.com/v2/YOUR_API_KEY
 | Profile      | File                                 | Wallet    | Risk   | Vipers            |
 |--------------|--------------------------------------|-----------|--------|-------------------|
 | Conservative | `src/config.conservative.rs.example` | < $100    | Low    | Maker, Time Decay |
-| Balanced     | `src/config.balanced.rs.example`     | $100–$300 | Medium | All nine          |
-| Aggressive   | `src/config.aggressive.rs.example`   | $200+     | High   | All nine          |
+| Balanced     | `src/config.balanced.rs.example`     | $100–$300 | Medium | All nine crypto   |
+| Aggressive   | `src/config.aggressive.rs.example`   | $200+     | High   | All nine crypto   |
 
 ```bash
 cp src/config.balanced.rs.example src/config.rs
@@ -918,7 +929,7 @@ setup for why write-capable tools are gated behind future work.
 
 ## FAQ
 
-**Why Rust?** Fearless concurrency — evaluating nine Vipers every 50ms needs a multi-threaded runtime with no GIL or GC pauses.
+**Why Rust?** Fearless concurrency — evaluating ten Vipers every 50ms needs a multi-threaded runtime with no GIL or GC pauses.
 
 **Can I trade multiple assets at once?** Yes — set `ASSETS=btc,eth,sol` in `.env`. Each asset runs its own independent patrol loop (raptors, session state, LLM advisor, SQLite DB) inside a `tokio::spawn`ed task. The wallet, CLOB client, and API server are shared. Each asset writes to its own DB file (`logs/btc-dradis.db`, `logs/eth-dradis.db`, etc.); pass `?asset=eth` to any API endpoint to scope results to that asset.
 
@@ -930,11 +941,11 @@ setup for why write-capable tools are gated behind future work.
 
 **GBoost is idle?** It trades only from an offline-trained model file at `logs/{asset}-gboost_planb_v1.json` (`GBOOST_PLANB_MODEL_FILENAME`). Without the file it logs the reason once and stays idle; there is no in-process training or cold start. A model whose stamped feature names do not match the build is refused at load, with the reason in the log.
 
-**Can I enable a Viper mid-session?** Yes — all nine are always instantiated. Toggle via Control Tower or `PATCH /api/config`. Takes effect on the next 50ms tick.
+**Can I enable a Viper mid-session?** Yes — all ten are always instantiated. Toggle via Control Tower or `PATCH /api/config`. Takes effect on the next 50ms tick.
 
 **Does DRADIS support the US Polymarket API?** Yes.  Polymarket's **US platform** is a separate, custodial, CFTC-regulated exchange with web2 auth (API key / secret / session token) and string/UUID market IDs. We have **venue abstraction** so a build targets one venue via a Cargo feature flag (`intl_clob` default, `us_retail`, `kalshi`) — single-venue per binary, so the US deployment carries none of the Polygon crypto weight and stays inside its own regulatory/network footprint. Start a US build with `VENUE=us ./start-local.sh`.
 
-**What about Kalshi?** Fully supported. Build with `--features kalshi` (or `VENUE=kalshi ./start-local.sh`) — RSA-PSS signed REST + WebSocket, crypto-first trading loop over Kalshi's 15-minute and hourly BTC/ETH series, all nine Vipers with the full Raptor stack, and event-precise fill confirmation. Paper-trade it risk-free against [demo.kalshi.co](https://demo.kalshi.co) with `KALSHI_DEMO=1`. See "Kalshi configuration" above.
+**What about Kalshi?** Fully supported. Build with `--features kalshi` (or `VENUE=kalshi ./start-local.sh`) — RSA-PSS signed REST + WebSocket, crypto-first trading loop over Kalshi's 15-minute and hourly BTC/ETH series, all nine crypto Vipers with the full Raptor stack, and event-precise fill confirmation. Paper-trade it risk-free against [demo.kalshi.co](https://demo.kalshi.co) with `KALSHI_DEMO=1`. See "Kalshi configuration" above.
 
 **Control Tower shows "Offline"?** Check: (1) DRADIS running? (2) `curl http://localhost:9000/api/health`? (3) Docker — same `dradis-net` network?
 

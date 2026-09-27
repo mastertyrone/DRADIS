@@ -624,6 +624,63 @@ impl crate::venues::deployment::DeploymentRunner for UsDeploymentRunner {
         }
         let now = Utc::now();
         let max_secs = max_days_to_close as i64 * 86_400;
+
+        // Sports goes to a game the bookmaker board can actually price, not to
+        // whatever closes soonest. `claims` alone is not enough: it admits every
+        // game market the venue lists, and on 2026-09-27 this venue's soonest-
+        // closing sports entries were Setka Cup table tennis and ITF women's
+        // qualifiers. Those churn on a roughly twenty-minute cycle, so ordering by
+        // soonest close systematically picked the one nearest its end and the
+        // deployment then failed re-resolving a market that had already closed
+        // ("no longer listed under sports"), over and over. The board covers
+        // neither competition, so even a deployment that won the race handed the
+        // sports squadron a game no Viper could price.
+        //
+        // `board_coverage` is the same rule the Kalshi selector uses, which is why
+        // it lives in the ledger rather than in either venue: it takes the best
+        // PRE-GAME candidate the board holds a line for, so the choice is a game
+        // with a consensus and a kick-off still ahead of it. That also retires the
+        // race as a side effect, since a board game kicks off hours out rather
+        // than minutes.
+        //
+        // Idle is the intended answer when nothing is covered. It follows that an
+        // operator running with the Sports Line Ledger switched off gets no sports
+        // squadron on this venue at all, which is the honest reading of an empty
+        // board: without the ledger there is no signal behind the slot.
+        if class == "sports" {
+            let board = crate::raptors::sports_ledger::board();
+            let candidates: Vec<(String, String, f64)> = claimed.iter().map(|p| {
+                let (yes, no) = crate::venues::us::sports::board_leg_ids(&p.slug);
+                (yes, no, p.volume)
+            }).collect();
+            let cov = crate::raptors::sports_ledger::board_coverage(&candidates, &board, now);
+            // Only when the picture has actually moved: this branch is reached on
+            // every seeder pass for as long as the slot stays empty.
+            let speak = crate::raptors::sports_ledger::coverage_changed("Polymarket US", &cov);
+            return match cov.best {
+                Some(i) => {
+                    // A selection is an event, not a state: always worth a line.
+                    info!(
+                        "📋 Polymarket US sports: {} of {} game(s) on the bookmaker board, {} \
+                         pre-game — selecting {}",
+                        cov.on_board, claimed.len(), cov.pre_game, claimed[i].slug,
+                    );
+                    Some(claimed[i].slug.clone())
+                }
+                None => {
+                    if speak {
+                        info!(
+                            "📋 Polymarket US sports: none of {} open game(s) are on the bookmaker \
+                             board pre-game ({} on board, {} pre-game) — leaving the sports slot \
+                             idle rather than deploying onto a game nothing can price",
+                            claimed.len(), cov.on_board, cov.pre_game,
+                        );
+                    }
+                    None
+                }
+            };
+        }
+
         claimed.into_iter()
             .filter(|p| match p.close_time {
                 // A market with no close time is "always open" by this venue's

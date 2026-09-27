@@ -770,12 +770,16 @@ async fn select_auto_deploy_market(
                 return Some(found[i].ticker.clone());
             }
             None => {
-                info!(
-                    "📋 Kalshi sports: none of {} open game(s) are on the bookmaker board pre-game \
-                     ({} on board, {} pre-game) — leaving the sports slot idle rather than deploying \
-                     onto a game nothing can price",
-                    found.len(), cov.on_board, cov.pre_game,
-                );
+                // Throttled for the same reason as the Polymarket US twin: the
+                // seeder reaches this arm on every pass while the slot is empty.
+                if crate::raptors::sports_ledger::coverage_changed("Kalshi", &cov) {
+                    info!(
+                        "📋 Kalshi sports: none of {} open game(s) are on the bookmaker board \
+                         pre-game ({} on board, {} pre-game) — leaving the sports slot idle rather \
+                         than deploying onto a game nothing can price",
+                        found.len(), cov.on_board, cov.pre_game,
+                    );
+                }
                 return None;
             }
         }

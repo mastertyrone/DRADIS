@@ -779,6 +779,27 @@ pub struct BoardCoverage {
     pub pre_game: usize,
 }
 
+/// True when this coverage summary differs from the last one logged under `venue`.
+///
+/// The auto-deploy seeder runs every few seconds and only reaches the coverage rule
+/// while the slot is EMPTY, which is precisely the long-lived state -- so an
+/// unthrottled line there states "leaving the sports slot idle" some seventeen
+/// thousand times a day and buries everything worth reading. An idle slot whose
+/// figures have not moved has nothing new to say, so it says it once.
+pub fn coverage_changed(venue: &str, cov: &BoardCoverage) -> bool {
+    static LAST: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<String, (bool, usize, usize)>>,
+    > = std::sync::OnceLock::new();
+    let now = (cov.best.is_some(), cov.on_board, cov.pre_game);
+    let cell = LAST.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    // A poisoned lock must not silence the log: fall back to reporting a change.
+    let Ok(mut map) = cell.lock() else { return true };
+    match map.get(venue) {
+        Some(prev) if *prev == now => false,
+        _ => { map.insert(venue.to_string(), now); true }
+    }
+}
+
 pub fn board_coverage(
     candidates: &[(String, String, f64)],
     board: &SportsBoard,
@@ -1887,6 +1908,46 @@ mod tests {
     /// line" because the one market it was given was not one of them. A squadron on
     /// an uncovered game also holds the venue's single sports slot while doing
     /// nothing, so idle is strictly better than deployed-and-mute.
+    /// The throttle has to be per-venue and driven by the figures, not by a timer:
+    /// one binary serves one venue, but a change from "0 on board" to "3 on board" is
+    /// news even seconds later.
+    ///
+    /// The venue keys are made unique per run rather than hard-coded. `coverage_changed`
+    /// remembers across calls in process-global state, so a test that claimed a fixed
+    /// name's first look would depend on nothing else having used that name -- which
+    /// made it fail the moment the harness ran it a second time in one process. Unique
+    /// keys assert the same behavior without asserting anything about test ordering.
+    #[test]
+    fn an_unchanged_idle_slot_reports_itself_once_per_venue() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static RUN: AtomicUsize = AtomicUsize::new(0);
+        let run = RUN.fetch_add(1, Ordering::Relaxed);
+        let venue = |n: char| format!("test-venue-{n}-{run}");
+
+        let idle = BoardCoverage { best: None, on_board: 0, pre_game: 0 };
+        let (a, b, c) = (venue('a'), venue('b'), venue('c'));
+
+        assert!(coverage_changed(&a, &idle), "the first look is always news");
+        assert!(!coverage_changed(&a, &idle), "an unchanged picture is not");
+        assert!(!coverage_changed(&a, &idle));
+
+        // A second venue keeps its own memory rather than being silenced by the first.
+        assert!(coverage_changed(&b, &idle));
+
+        // The figures moving is news, and so is going back.
+        let partial = BoardCoverage { best: None, on_board: 3, pre_game: 0 };
+        assert!(coverage_changed(&a, &partial));
+        assert!(!coverage_changed(&a, &partial));
+        assert!(coverage_changed(&a, &idle));
+
+        // Only whether a pick EXISTS matters, not which index it landed on, so a
+        // rotating choice among covered games does not chatter.
+        let pick_0 = BoardCoverage { best: Some(0), on_board: 4, pre_game: 2 };
+        let pick_1 = BoardCoverage { best: Some(1), on_board: 4, pre_game: 2 };
+        assert!(coverage_changed(&c, &pick_0));
+        assert!(!coverage_changed(&c, &pick_1), "a different index is the same picture");
+    }
+
     #[test]
     fn the_seeder_only_picks_games_the_board_can_price() {
         let now = Utc::now();
