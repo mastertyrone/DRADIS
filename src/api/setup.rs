@@ -197,6 +197,19 @@ struct RaptorSource {
     /// validated" warning lives: these values pass through to the upstream API
     /// verbatim and DRADIS cannot check them.
     selector_fields: &'static [&'static str],
+    /// Config-schema group holding this Raptor's remaining `DynamicConfig` knobs,
+    /// rendered in the panel behind a per-Raptor expander.
+    ///
+    /// `poll_field` and `selector_fields` already surface a cadence and a
+    /// what-to-watch selector; everything else a Raptor tunes had nowhere to go, so
+    /// the sports ledger's five settings were briefly filed under "Global" and read
+    /// as engine-wide switches next to ghost mode and fee rates. Naming the group
+    /// here keeps a Raptor's credential and its tuning on one card, and keeps the
+    /// panel contributable: a new Raptor with settings needs no React change.
+    ///
+    /// The expander omits `poll_field` and `selector_fields`, which the card renders
+    /// with their own controls, so a key belonging to both appears once.
+    settings_group: Option<&'static str>,
 }
 
 const RAPTOR_SOURCES: &[RaptorSource] = &[
@@ -204,21 +217,21 @@ const RAPTOR_SOURCES: &[RaptorSource] = &[
         id: "price", name: "Price Raptor", source: "Binance spot (public)",
         blurb: "Oracle price, velocity, acceleration and drift — the core signal every Viper reads.",
         tier: "required", keys: &[], test_kind: None, signup_url: None,
-        poll_field: None, free_quota: None, selector_fields: &[],
+        poll_field: None, free_quota: None, selector_fields: &[], settings_group: None,
         region_note: Some("Binance is geo-blocked from US IPs (HTTP 451). This feed rotates automatically to Binance's open data mirror, which is unrestricted — no action needed."),
     },
     RaptorSource {
         id: "funding", name: "Funding Raptor", source: "Binance perpetuals, OKX fallback (public)",
         blurb: "Perp funding rates; the Basis Viper uses them to confirm retail skew.",
         tier: "required", keys: &[], test_kind: None, signup_url: None,
-        poll_field: None, free_quota: None, selector_fields: &[],
+        poll_field: None, free_quota: None, selector_fields: &[], settings_group: None,
         region_note: Some("Binance is geo-blocked from US IPs (HTTP 451). This feed fails over to OKX automatically, which serves the same signal and is reachable from the US — no action needed."),
     },
     RaptorSource {
         id: "derivatives", name: "Derivatives Raptor", source: "Binance derivatives, OKX fallback (public)",
         blurb: "Open interest and CVD ratio, fused as features by GBoost and Convergence.",
         tier: "required", keys: &[], test_kind: None, signup_url: None,
-        poll_field: None, free_quota: None, selector_fields: &[],
+        poll_field: None, free_quota: None, selector_fields: &[], settings_group: None,
         region_note: Some("Binance is geo-blocked from US IPs (HTTP 451). This feed fails over to OKX automatically, which serves the same signal and is reachable from the US — no action needed."),
     },
     RaptorSource {
@@ -226,7 +239,7 @@ const RAPTOR_SOURCES: &[RaptorSource] = &[
         blurb: "ETF premium \"institutional pulse\" (BTC only, US market hours). Shares one IEX connection with Horizon. Alpaca's free tier is sufficient — the feed is real-time IEX, not delayed.",
         tier: "recommended", keys: &["ALPACA_API_KEY_ID", "ALPACA_API_SECRET_KEY"],
         test_kind: Some("alpaca"), signup_url: Some("https://alpaca.markets"),
-        poll_field: None, free_quota: None, selector_fields: &[],
+        poll_field: None, free_quota: None, selector_fields: &[], settings_group: None,
         region_note: None,
     },
     RaptorSource {
@@ -234,7 +247,7 @@ const RAPTOR_SOURCES: &[RaptorSource] = &[
         blurb: "TradFi macro velocity from SPY/QQQ/UVXY plus a VIX proxy (BTC only). Uses the same Alpaca keys as Tide — configure them once.",
         tier: "recommended", keys: &["ALPACA_API_KEY_ID", "ALPACA_API_SECRET_KEY"],
         test_kind: Some("alpaca"), signup_url: Some("https://alpaca.markets"),
-        poll_field: None, free_quota: None, selector_fields: &[],
+        poll_field: None, free_quota: None, selector_fields: &[], settings_group: None,
         region_note: None,
     },
     RaptorSource {
@@ -244,6 +257,7 @@ const RAPTOR_SOURCES: &[RaptorSource] = &[
         test_kind: Some("odds"), signup_url: Some("https://the-odds-api.com"),
         poll_field: None, free_quota: Some((500, "month")),
         selector_fields: &["sports_odds_regions"],
+        settings_group: Some("Sports Raptor"),
         region_note: None,
     },
     RaptorSource {
@@ -253,6 +267,7 @@ const RAPTOR_SOURCES: &[RaptorSource] = &[
         test_kind: Some("livetennis"), signup_url: Some("https://livetennisapi.com"),
         poll_field: Some("tennis_poll_secs"), free_quota: Some((100, "day")),
         selector_fields: &["tennis_tour"],
+        settings_group: Some("Tennis Raptor"),
         region_note: None,
     },
 ];
@@ -791,6 +806,7 @@ async fn get_raptor_sources() -> Response {
             "signup_url": r.signup_url, "poll_field": r.poll_field,
             "free_quota": r.free_quota.map(|(n, p)| json!({"requests": n, "period": p})),
             "selector_fields": r.selector_fields,
+            "settings_group": r.settings_group,
         })
     }).collect();
     Json(json!({ "raptors": items })).into_response()

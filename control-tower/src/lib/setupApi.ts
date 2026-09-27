@@ -120,6 +120,8 @@ export interface RaptorSource {
    *  tour). Rendered as text inputs; the schema description carries the
    *  "not validated" warning. */
   selector_fields: string[];
+  /** Config-schema group holding this Raptor's remaining knobs, or null. */
+  settings_group: string | null;
 }
 
 export interface TestResult {

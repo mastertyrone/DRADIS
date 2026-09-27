@@ -981,6 +981,58 @@ function FeedSelector({ fieldKey, schema }: { fieldKey: string; schema: ConfigFi
   );
 }
 
+/**
+ * A Raptor's remaining DynamicConfig knobs, collapsed by default.
+ *
+ * Its credential lives on this card, so its tuning belongs here too: the sports
+ * ledger's five settings were briefly a separate "Sports Raptor" section further
+ * down the Setup page, which meant two cards named for one Raptor and its key
+ * separated from what it does. Driven by `settings_group` on the Raptor, so a
+ * contributed Raptor with settings needs no change here.
+ *
+ * Collapsed because these are tuning, not setup: an operator getting a key working
+ * should not have to scroll past a dozen advanced fields to reach the next Raptor.
+ * Poll cadence and feed selectors are excluded — the card renders those itself with
+ * controls that show quota arithmetic, and showing them twice would imply two
+ * settings.
+ */
+function RaptorSettings({
+  raptor, schema,
+}: { raptor: RaptorSource; schema: ConfigFieldSchema[] }) {
+  const [open, setOpen] = useState(false);
+  const { data: config, mutate } = useSWR('dynamic-config', getConfig, { revalidateOnFocus: false });
+
+  const patch = useCallback(async (pp: Partial<DynamicConfig>) => {
+    await patchConfig(pp);
+    await mutate();
+  }, [mutate]);
+
+  const shown = new Set([raptor.poll_field, ...raptor.selector_fields].filter(Boolean) as string[]);
+  const fields = schema.filter(f => f.group === raptor.settings_group && !shown.has(f.key));
+  if (fields.length === 0) return null;
+
+  return (
+    <div className="border-t border-[#1e1e32] pt-3">
+      <button
+        type="button"
+        onClick={() => setOpen(o => !o)}
+        className="text-[11px] font-mono text-gray-500 hover:text-gray-300 transition-colors"
+      >
+        {open ? '▾' : '▸'} {fields.length} setting{fields.length === 1 ? '' : 's'}
+      </button>
+      {open && (
+        <div className="mt-3 space-y-3">
+          {!config
+            ? <p className="text-[11px] font-mono text-gray-600">Loading…</p>
+            : fields.map(f => (
+                <AdvancedRow key={f.key} field={f} config={config} onPatch={patch} disabled={false} />
+              ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function RaptorCard({
   raptor, creds, drafts, onDraft, schema,
 }: {
@@ -1112,6 +1164,8 @@ function RaptorCard({
       )}
 
       {raptor.poll_field && <PollCadence raptor={raptor} schema={schema} />}
+
+      {raptor.settings_group && <RaptorSettings raptor={raptor} schema={schema} />}
 
       {result && (
         <div className={`text-xs font-mono rounded-lg px-3 py-2 border ${
@@ -1393,15 +1447,6 @@ const GLOBAL_CONFIG_GROUPS: { group: string; title: string; blurb: string; omit?
     blurb: 'Instance-wide switches the whole engine reads — every squadron sees the ' +
       'same value, so they cannot be set per squadron.',
     omit: ['ghost_mode'],
-  },
-  {
-    group: 'Sports Raptor',
-    title: 'Sports Raptor',
-    blurb: 'The bookmaker-consensus feed every sports Viper reads. One ledger serves ' +
-      'the whole instance, so these are instance-wide: which leagues it follows, when ' +
-      'it snapshots each game, and how much of your Odds API quota it may spend. ' +
-      'Snapshot spacing is the one to watch — Bookline refuses a line older than its ' +
-      'own Max Feed Age To Quote, so wide gaps here leave it unable to quote.',
   },
   {
     group: 'GBoost Training',

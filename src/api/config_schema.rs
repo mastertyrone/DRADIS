@@ -68,10 +68,11 @@ pub enum ConfigScope {
 pub fn scope_for_group(group: &str) -> Option<ConfigScope> {
     Some(match group {
         // Instance-wide: rendered in Setup, read from the global row.
-        "Global" | "Deployment" | "Raptor Polling" | "GBoost Training" => ConfigScope::Global,
-        // The Sports Raptor's own feed settings: one ledger serves the instance and
-        // the raptor reads them off the global watch, not a squadron snapshot.
-        "Sports Raptor" => ConfigScope::Global,
+        "Global" | "Deployment" | "GBoost Training" => ConfigScope::Global,
+        // A Raptor's own feed settings: one Raptor serves the whole instance and reads
+        // them off the global watch rather than a squadron snapshot. Rendered on that
+        // Raptor's card in Setup, via `settings_group` in `RAPTOR_SOURCES`.
+        "Sports Raptor" | "Tennis Raptor" => ConfigScope::Global,
         // Per-squadron: rendered on a squadron page, read from its own row.
         "Order Book" | "Exit Accounting" => ConfigScope::Squadron,
         // Line-quality gates BOTH sports consumers read (FairValue and Maker), so
@@ -1004,11 +1005,17 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
     }
 
     {
-        let g = "Raptor Polling"; let e: Option<&'static str> = None;
-        v.push(F::new(g, e, "tennis_poll_secs", "Tennis Poll Interval", "secs", false,
+        // No shared "Raptor Polling" group: a Raptor's knobs belong to that Raptor,
+        // because the Setup panel now renders them on its card via `settings_group`
+        // in `RAPTOR_SOURCES`. One pooled group could only be rendered under some
+        // heading belonging to no Raptor at all, which is how the sports ledger's
+        // settings ended up filed as engine-wide switches.
+        let tennis = "Tennis Raptor"; let sports = "Sports Raptor";
+        let e: Option<&'static str> = None;
+        v.push(F::new(tennis, e, "tennis_poll_secs", "Tennis Poll Interval", "secs", false,
             "Seconds between Tennis Raptor (Live Tennis API) polls. The 900s default keeps an all-day run inside the free tier's 100 requests/day; ~60s gives near point-level tracking but needs a paid plan.")
             .range(5.0, 86_400.0).step(5.0).unit("s"));
-        v.push(F::new(g, e, "tennis_low_budget_warn", "Tennis Budget Warning", "secs", true,
+        v.push(F::new(tennis, e, "tennis_low_budget_warn", "Tennis Budget Warning", "secs", true,
             "Warn when the Live Tennis API reports this many requests remaining in the current window.")
             .min(0.0).step(5.0));
 
@@ -1019,12 +1026,12 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
         // filter returns an empty match list that reads as a healthy quiet
         // period. The descriptions carry that warning, since it is the only
         // guard rail these fields have.
-        v.push(F::new(g, e, "sports_odds_regions", "Sports Regions", "string", true,
+        v.push(F::new(sports, e, "sports_odds_regions", "Sports Regions", "string", true,
             "Comma-separated bookmaker regions for the odds query: us, us2, uk, eu, au. ⚠️ Not validated — an unrecognized region returns no bookmakers."));
         // The ledger's fields sit in "Global", not "Raptor Polling": Setup renders
         // Raptor Polling only through each raptor card's hardcoded text selectors,
         // which cannot save a switch or a number. "Global" is Setup's Engine card.
-        v.push(F::new("Sports Raptor", None, "sports_ledger_enabled", "Enabled", "bool", false,
+        v.push(F::new(sports, None, "sports_ledger_enabled", "Enabled", "bool", false,
             "Record the sportsbook consensus against Polymarket prices for every matched sports moneyline, and each market's resolution. Research data for the sports spike's go/no-go statistics; nothing trades from it. While on, it owns The Odds API budget and it owns the Odds API budget. Enable it on ONE DRADIS instance per Odds API key: each instance budgets as if it had the whole quota."));
         v.push(F::new("FairValue", None, "enable_sports_fairvalue", "Sports Lane", "bool", false,
             "Let FairValue price a sports moneyline from the bookmaker consensus instead of its crypto model, which needs a strike, an oracle and a volatility estimate a game does not have. Needs the Sports Line Ledger on and an Odds API key: without a line the viper simply idles. Off by default because the favorite-side hypothesis is still gathering its sample."));
@@ -1112,19 +1119,19 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
             "Hold a sports position to settlement rather than stopping it out on price. The evidence being gathered is for a hold-to-settlement thesis, so a percentage stop measures a different strategy: a 0.70 favorite dipping to 0.60 on one bad drive is a 14% mark against a position the thesis says to hold. The catastrophic floor stays armed as insurance against a stale line."));
         v.push(F::new("FairValue", Some("enable_sports_fairvalue"), "sports_fairvalue_catastrophic_armed", "Sports Catastrophic Floor", "bool", true,
             "Keep the catastrophic floor armed on a sports position. The hypothesis being measured is hold-to-settlement with no stop at all, so a run that means to reproduce it exactly can disarm even this. Left on by default: a line that goes stale mid-game is the case the floor exists for."));
-        v.push(F::new("Sports Raptor", None, "sports_ledger_leagues", "Leagues", "string", true,
+        v.push(F::new(sports, None, "sports_ledger_leagues", "Leagues", "string", true,
             "Comma-separated code=sport_key pairs mapping Polymarket's league code (Gamma /sports, e.g. mlb, fl1) to The Odds API sport key (e.g. baseball_mlb). Discovery is free; only snapshots cost credits. ⚠️ Not validated — an unknown code or key simply matches no games."));
-        v.push(F::new("Sports Raptor", None, "sports_ledger_snapshot_offsets_mins", "Snapshot Offsets", "string", true,
+        v.push(F::new(sports, None, "sports_ledger_snapshot_offsets_mins", "Snapshot Offsets", "string", true,
             "Snapshot times in minutes relative to each game's start, comma-separated (negative = before kickoff). One Odds API call covers every game of a sport, so games starting close together share a snapshot. Each added offset costs roughly one more credit per active sport-day. \
              \
              The spacing here IS the cadence: the snapshot and coalesce windows are derived from the tightest gap in this list, so two adjacent offsets can no longer be swallowed by a fixed 30-minute window as they once were. Keep the pre-game gaps at or under Bookline's Max Feed Age To Quote (default 10 minutes) or that viper will read the line as stale and refuse for most of the window — a schedule with 45- and 60-minute pre-game holes leaves it able to quote only a few minutes in every hour. Positive offsets snapshot after kick-off, which is research data only: no viper trades in play."));
-        v.push(F::new("Sports Raptor", None, "sports_ledger_credit_reserve", "Credit Reserve", "int", true,
+        v.push(F::new(sports, None, "sports_ledger_credit_reserve", "Credit Reserve", "int", true,
             "Odds API credits the ledger never spends into. The rest of the month's credits are spread evenly over the days until the quota resets.")
             .min(0.0).step(5.0));
-        v.push(F::new("Sports Raptor", None, "sports_ledger_quota_reset_day", "Quota Reset Day", "int", true,
+        v.push(F::new(sports, None, "sports_ledger_quota_reset_day", "Quota Reset Day", "int", true,
             "Day of the month (UTC) your Odds API quota resets, shown on your account page. Days after the 28th are treated as the 28th.")
             .range(1.0, 28.0).step(1.0));
-        v.push(F::new(g, e, "tennis_tour", "Tennis Tour", "string", true,
+        v.push(F::new(tennis, e, "tennis_tour", "Tennis Tour", "string", true,
             "Live Tennis API tour filter: atp, wta, challenger, itf, juniors — or blank for all tours. ⚠️ Not validated, and this one fails SILENTLY: a misspelt tour returns an empty match list, which is indistinguishable from tennis being off-season or between sessions. Leave blank if unsure."));
     }
 
@@ -1212,6 +1219,60 @@ mod tests {
     /// The two auto-deploy switches decide whether DRADIS commits capital to a
     /// market class on its own, so they belong on the Basic panel where an
     /// operator will see them, not behind the Advanced modal.
+    /// Every group renders somewhere. The counterpart to the viper-card check.
+    ///
+    /// A group is rendered by exactly one of three allow-lists, none of which the Rust
+    /// side can see: `GLOBAL_CONFIG_GROUPS` in `SetupPage.tsx`, `SQUADRON_GROUPS` in
+    /// `SquadronDetailView.tsx`, or a Raptor's `settings_group` in `RAPTOR_SOURCES`.
+    /// A group in none of them is registered, valid, correctly scoped, and rendered on
+    /// no page at all — the failure that hid all sixteen Bookline knobs, where nothing
+    /// anywhere reported a problem. So the schema asserts against the front end rather
+    /// than trusting that someone updated both sides.
+    ///
+    /// Skipped when the sources are absent, so an engine-only build still passes.
+    #[test]
+    fn every_group_renders_somewhere() {
+        let read = |p: &str| std::fs::read_to_string(p).ok();
+        let (Some(setup_tsx), Some(squadron_tsx), Some(setup_rs)) = (
+            read("control-tower/src/components/SetupPage.tsx"),
+            read("control-tower/src/components/SquadronDetailView.tsx"),
+            read("src/api/setup.rs"),
+        ) else {
+            eprintln!("front-end sources not present — skipping render check");
+            return;
+        };
+        let viper_cards = read("control-tower/src/lib/api.ts").unwrap_or_default();
+
+        // A group counts as rendered if its name appears in the list that renders it.
+        // Substring matching is deliberate: these are quoted string literals in the
+        // respective files, and a group name is distinctive enough not to collide.
+        // Matched against the DECLARATION, not any mention. A Raptor's display `name`
+        // is often the same string as its settings group, so a loose search would
+        // report a group as rendered because the Raptor exists at all — passing for
+        // the wrong reason is worse than not testing.
+        let rendered = |g: &str| {
+            setup_tsx.contains(&format!("group: '{g}'"))
+                || squadron_tsx.contains(&format!("'{g}'"))
+                || setup_rs.contains(&format!("settings_group: Some(\"{g}\")"))
+                || viper_cards.contains(&format!("name: '{g}'"))
+        };
+
+        let mut orphans: Vec<&str> = config_schema()
+            .iter()
+            .map(|f| f.group)
+            .filter(|g| !rendered(g))
+            .collect();
+        orphans.sort_unstable();
+        orphans.dedup();
+        assert!(
+            orphans.is_empty(),
+            "these groups are in no render list, so their knobs appear on no page: \
+             {orphans:?} — add each to GLOBAL_CONFIG_GROUPS (SetupPage.tsx), \
+             SQUADRON_GROUPS (SquadronDetailView.tsx), VIPER_DEFS (api.ts), or a \
+             Raptor's settings_group (src/api/setup.rs)",
+        );
+    }
+
     #[test]
     fn auto_deploy_switches_are_not_hidden_behind_advanced() {
         for f in config_schema() {
