@@ -69,9 +69,16 @@ pub fn scope_for_group(group: &str) -> Option<ConfigScope> {
     Some(match group {
         // Instance-wide: rendered in Setup, read from the global row.
         "Global" | "Deployment" | "Raptor Polling" | "GBoost Training" => ConfigScope::Global,
+        // The Sports Raptor's own feed settings: one ledger serves the instance and
+        // the raptor reads them off the global watch, not a squadron snapshot.
+        "Sports Raptor" => ConfigScope::Global,
         // Per-squadron: rendered on a squadron page, read from its own row.
         "Order Book" | "Exit Accounting" => ConfigScope::Squadron,
-        "Arbitrage" | "Basis" | "Bookline Viper" | "Convergence" | "FairValue" | "GBoost"
+        // Line-quality gates BOTH sports consumers read (FairValue and Maker), so
+        // they belong to neither card alone. Squadron, because the vipers read them
+        // from the per-tick squadron snapshot.
+        "Sports Lines" => ConfigScope::Squadron,
+        "Arbitrage" | "Basis" | "Bookline" | "Convergence" | "FairValue" | "GBoost"
         | "Maker" | "Momentum" | "Time Decay" | "TrendReversal" => ConfigScope::Squadron,
         _ => return None,
     })
@@ -1017,22 +1024,25 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
         // The ledger's fields sit in "Global", not "Raptor Polling": Setup renders
         // Raptor Polling only through each raptor card's hardcoded text selectors,
         // which cannot save a switch or a number. "Global" is Setup's Engine card.
-        v.push(F::new("Global", None, "sports_ledger_enabled", "Sports Line Ledger", "bool", false,
+        v.push(F::new("Sports Raptor", None, "sports_ledger_enabled", "Enabled", "bool", false,
             "Record the sportsbook consensus against Polymarket prices for every matched sports moneyline, and each market's resolution. Research data for the sports spike's go/no-go statistics; nothing trades from it. While on, it owns The Odds API budget and it owns the Odds API budget. Enable it on ONE DRADIS instance per Odds API key: each instance budgets as if it had the whole quota."));
-        v.push(F::new("Global", None, "enable_sports_fairvalue", "Sports FairValue", "bool", false,
+        v.push(F::new("FairValue", None, "enable_sports_fairvalue", "Sports Lane", "bool", false,
             "Let FairValue price a sports moneyline from the bookmaker consensus instead of its crypto model, which needs a strike, an oracle and a volatility estimate a game does not have. Needs the Sports Line Ledger on and an Odds API key: without a line the viper simply idles. Off by default because the favorite-side hypothesis is still gathering its sample."));
-        v.push(F::new("Global", None, "sports_fairvalue_min_edge", "Sports FairValue Min Edge", "price", true,
+        v.push(F::new("FairValue", Some("enable_sports_fairvalue"), "sports_fairvalue_min_edge", "Sports Min Edge", "price", true,
             "Smallest consensus-minus-ask gap FairValue will enter a sports market on. Polymarket sits AT consensus pre-game on average (mean gap under a cent), so a small number here does not mean more trades, it means acting on noise."));
-        v.push(F::new("Global", None, "sports_line_max_age_secs", "Sports Line Max Age", "int", true,
+        v.push(F::new("Sports Lines", None, "sports_line_max_age_secs", "Max Line Age", "int", true,
             "A board line older than this is not acted on by any consumer. The odds are read on a snapshot schedule, not continuously, so a line minutes old describes a different game state."));
-        v.push(F::new("Global", None, "sports_line_min_books", "Sports Line Min Books", "int", true,
+        v.push(F::new("Sports Lines", None, "sports_line_min_books", "Min Books", "int", true,
             "Fewest bookmakers behind a consensus a consumer will act on. A two-book consensus is one book's opinion plus a de-vig artifact: books quoting identical odds de-vig differently because their overrounds differ."));
-        v.push(F::new("Global", None, "sports_maker_max_dispersion", "Sports Maker Max Dispersion", "price", true,
+        v.push(F::new("Maker", Some("enable_maker"), "sports_maker_max_dispersion", "Sports Max Dispersion", "price", true,
             "Maker will not quote a game whose books disagree by more than this (highest minus lowest book probability). A wide line is a soft line: the books themselves do not know the price, so a passive quote is likelier to be picked off than filled."));
-        v.push(F::new("Global", None, "sports_fairvalue_min_consensus", "Sports Favorite Floor", "price", true,
+        v.push(F::new("FairValue", Some("enable_sports_fairvalue"), "sports_fairvalue_min_consensus", "Sports Favorite Floor", "price", true,
             "Smallest bookmaker consensus a sports FairValue entry will buy. The pre-registered hypothesis is favorite-side only (0.55 and above); the longshot side is its declared negative control, and the de-vig method inflates consensus exactly there, so cheap outcomes show an 'edge' that is an artifact. Setting this below 0.55 trades outside the hypothesis the evidence is being gathered for."));
         // ── Bookline (sports, maker-first, ghost-only) ────────────────────────
-        let bl = "Bookline Viper";
+        // MUST equal the Control Tower card name in `VIPER_DEFS`: both ViperCard and
+        // the advanced modal filter on `group === viper.name`, so "Bookline Viper"
+        // matched neither and every Bookline knob rendered nowhere at all.
+        let bl = "Bookline";
         v.push(F::new(bl, None, "bookline_enabled", "Enabled", "bool", true,
             "Run Bookline. It rests a post-only bid under the bookmaker consensus on one side of a sports \
              moneyline and holds to fee-free settlement, which is the only way these books can be traded: a \
@@ -1096,20 +1106,22 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
         v.push(F::new(bl, None, "bookline_resting_tp_edge", "Take Profit Edge", "price", true,
             "Edge above consensus for the resting take-profit ask. Settlement is the plan and it is fee-free; \
              this is the bonus when the market will pay the consensus plus an edge before the game starts."));
-        v.push(F::new("Global", None, "sports_fairvalue_max_dispersion", "Sports FairValue Max Dispersion", "price", true,
+        v.push(F::new("FairValue", Some("enable_sports_fairvalue"), "sports_fairvalue_max_dispersion", "Sports Max Dispersion", "price", true,
             "Widest book disagreement (highest minus lowest book probability) a sports FairValue entry will accept. A wide line is a soft line: if the books do not agree what the game is worth, neither does the consensus derived from them."));
-        v.push(F::new("Global", None, "sports_fairvalue_settle_hold", "Sports Hold To Settlement", "bool", true,
+        v.push(F::new("FairValue", Some("enable_sports_fairvalue"), "sports_fairvalue_settle_hold", "Sports Hold To Settlement", "bool", true,
             "Hold a sports position to settlement rather than stopping it out on price. The evidence being gathered is for a hold-to-settlement thesis, so a percentage stop measures a different strategy: a 0.70 favorite dipping to 0.60 on one bad drive is a 14% mark against a position the thesis says to hold. The catastrophic floor stays armed as insurance against a stale line."));
-        v.push(F::new("Global", None, "sports_fairvalue_catastrophic_armed", "Sports Catastrophic Floor", "bool", true,
+        v.push(F::new("FairValue", Some("enable_sports_fairvalue"), "sports_fairvalue_catastrophic_armed", "Sports Catastrophic Floor", "bool", true,
             "Keep the catastrophic floor armed on a sports position. The hypothesis being measured is hold-to-settlement with no stop at all, so a run that means to reproduce it exactly can disarm even this. Left on by default: a line that goes stale mid-game is the case the floor exists for."));
-        v.push(F::new("Global", None, "sports_ledger_leagues", "Ledger Leagues", "string", true,
+        v.push(F::new("Sports Raptor", None, "sports_ledger_leagues", "Leagues", "string", true,
             "Comma-separated code=sport_key pairs mapping Polymarket's league code (Gamma /sports, e.g. mlb, fl1) to The Odds API sport key (e.g. baseball_mlb). Discovery is free; only snapshots cost credits. ⚠️ Not validated — an unknown code or key simply matches no games."));
-        v.push(F::new("Global", None, "sports_ledger_snapshot_offsets_mins", "Ledger Snapshot Offsets", "string", true,
-            "Snapshot times in minutes relative to each game's start, comma-separated (negative = before kickoff). One Odds API call covers every game of a sport, so games starting close together share a snapshot. Each added offset costs roughly one more credit per active sport-day. Offsets less than 30 minutes apart share a single snapshot."));
-        v.push(F::new("Global", None, "sports_ledger_credit_reserve", "Ledger Credit Reserve", "int", true,
+        v.push(F::new("Sports Raptor", None, "sports_ledger_snapshot_offsets_mins", "Snapshot Offsets", "string", true,
+            "Snapshot times in minutes relative to each game's start, comma-separated (negative = before kickoff). One Odds API call covers every game of a sport, so games starting close together share a snapshot. Each added offset costs roughly one more credit per active sport-day. \
+             \
+             The spacing here IS the cadence: the snapshot and coalesce windows are derived from the tightest gap in this list, so two adjacent offsets can no longer be swallowed by a fixed 30-minute window as they once were. Keep the pre-game gaps at or under Bookline's Max Feed Age To Quote (default 10 minutes) or that viper will read the line as stale and refuse for most of the window — a schedule with 45- and 60-minute pre-game holes leaves it able to quote only a few minutes in every hour. Positive offsets snapshot after kick-off, which is research data only: no viper trades in play."));
+        v.push(F::new("Sports Raptor", None, "sports_ledger_credit_reserve", "Credit Reserve", "int", true,
             "Odds API credits the ledger never spends into. The rest of the month's credits are spread evenly over the days until the quota resets.")
             .min(0.0).step(5.0));
-        v.push(F::new("Global", None, "sports_ledger_quota_reset_day", "Ledger Quota Reset Day", "int", true,
+        v.push(F::new("Sports Raptor", None, "sports_ledger_quota_reset_day", "Quota Reset Day", "int", true,
             "Day of the month (UTC) your Odds API quota resets, shown on your account page. Days after the 28th are treated as the 28th.")
             .range(1.0, 28.0).step(1.0));
         v.push(F::new(g, e, "tennis_tour", "Tennis Tour", "string", true,
@@ -1219,6 +1231,52 @@ mod tests {
     /// Every group must declare a scope. A new group with no entry in
     /// `scope_for_group` silently inherits the constructor default, which is the
     /// "guess and hope" this whole mechanism exists to end.
+    /// Every viper group must name a card that actually exists in the Control Tower.
+    ///
+    /// `ViperCard` and the advanced modal both select a viper's fields with
+    /// `group === viper.name`, an exact string match against `VIPER_DEFS`. Bookline's
+    /// group was `"Bookline Viper"` against a card named `"Bookline"`, so all sixteen
+    /// of its knobs — including the two staleness thresholds its behavior now turns
+    /// on — were registered here and rendered on no page at all. Nothing failed: the
+    /// schema was valid, the keys existed, the scope was right, and the controls were
+    /// simply absent. That is the failure this test exists to make loud.
+    ///
+    /// Reads the frontend source because that is where the card names live. Skipped
+    /// rather than failed when the file is absent, so a build without the Control
+    /// Tower checkout (a container that compiles only the engine) still passes.
+    #[test]
+    fn every_viper_group_names_a_control_tower_card() {
+        let Ok(defs) = std::fs::read_to_string("control-tower/src/lib/api.ts") else {
+            eprintln!("control-tower source not present — skipping card-name check");
+            return;
+        };
+        // `name: 'Arbitrage',` -> Arbitrage
+        let cards: Vec<String> = defs
+            .split("name: '")
+            .skip(1)
+            .filter_map(|rest| rest.split('\'').next().map(str::to_string))
+            .collect();
+        assert!(!cards.is_empty(), "found no VIPER_DEFS card names to check against");
+
+        // Squadron-scoped groups that are deliberately NOT viper cards: they render
+        // on the squadron page through its own allow-list instead.
+        const NON_VIPER: &[&str] = &["Order Book", "Exit Accounting", "Sports Lines"];
+
+        let mut orphans: Vec<&str> = config_schema()
+            .iter()
+            .filter(|f| scope_for_group(f.group) == Some(ConfigScope::Squadron))
+            .map(|f| f.group)
+            .filter(|g| !NON_VIPER.contains(g) && !cards.iter().any(|c| c == g))
+            .collect();
+        orphans.sort_unstable();
+        orphans.dedup();
+        assert!(
+            orphans.is_empty(),
+            "these groups match no Control Tower card, so their knobs render nowhere: \
+             {orphans:?} — the cards are {cards:?}",
+        );
+    }
+
     #[test]
     fn every_group_declares_a_scope() {
         let mut missing: Vec<&str> = config_schema()

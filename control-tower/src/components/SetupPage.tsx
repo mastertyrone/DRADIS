@@ -1395,6 +1395,15 @@ const GLOBAL_CONFIG_GROUPS: { group: string; title: string; blurb: string; omit?
     omit: ['ghost_mode'],
   },
   {
+    group: 'Sports Raptor',
+    title: 'Sports Raptor',
+    blurb: 'The bookmaker-consensus feed every sports Viper reads. One ledger serves ' +
+      'the whole instance, so these are instance-wide: which leagues it follows, when ' +
+      'it snapshots each game, and how much of your Odds API quota it may spend. ' +
+      'Snapshot spacing is the one to watch — Bookline refuses a line older than its ' +
+      'own Max Feed Age To Quote, so wide gaps here leave it unable to quote.',
+  },
+  {
     group: 'GBoost Training',
     title: 'GBoost Training',
     blurb: 'The in-engine pipeline that trains, validates and adopts the GBoost plan-B ' +

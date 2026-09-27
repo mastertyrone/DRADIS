@@ -238,7 +238,10 @@ interface Props {
  * politics squadron has no Momentum card, and inferring would then treat
  * Momentum's own fields as squadron-wide.
  */
-const SQUADRON_GROUPS = ['Order Book', 'Exit Accounting'];
+// 'Sports Lines' holds the line-quality gates that BOTH FairValue and Maker read
+// on sports markets. They sit here rather than on either card because duplicating
+// one key onto two cards would imply two independent settings.
+const SQUADRON_GROUPS = ['Order Book', 'Exit Accounting', 'Sports Lines'];
 
 function SquadronSettingsCard({
   config,
