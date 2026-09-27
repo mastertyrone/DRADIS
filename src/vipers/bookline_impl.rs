@@ -745,10 +745,18 @@ impl Strategy for BooklineStrategy {
         // floor on a two-outcome game, so this is not really a choice in practice —
         // but a draw market has three outcomes and the floor does not guarantee it.
         let mut best: Option<(usize, MarketId, Decimal, Decimal, Decimal, Decimal)> = None;
-        let mut last_refusal = String::new();
+        // Per side, not one shared slot. A single `last_refusal` reported whichever
+        // leg was examined LAST, which on a two-outcome game is always the NO leg —
+        // so on the Angels/Mariners market every one of 124 overnight refusals read
+        // "consensus below the favorite floor" (true of the 0.414 underdog) while the
+        // real constraint on the tradeable 0.586 side was that the best bid already
+        // sat above the consensus minus the edge. An operator reading that log would
+        // conclude the market was a longshot when it was actually just fully priced.
+        // Maker reports its legs separately for the same reason.
+        let mut refusals: [Option<String>; 2] = [None, None];
         for (side, token, bid, ask) in legs(ctx) {
             let Some(line) = board.side(side) else {
-                last_refusal = LineRefusal::NoLine.label().to_string();
+                refusals[side] = Some(LineRefusal::NoLine.label().to_string());
                 continue;
             };
             let consensus = Decimal::try_from(line.consensus).unwrap_or(Decimal::ZERO);
@@ -767,7 +775,7 @@ impl Strategy for BooklineStrategy {
                 dc.bookline_min_consensus, dc.bookline_min_books, dc.bookline_max_dispersion,
                 dc.bookline_max_feed_age_secs, dc.bookline_pull_before_start_secs,
             ) {
-                last_refusal = r.label().to_string();
+                refusals[side] = Some(r.label().to_string());
                 continue;
             }
             let drift = match (line.drift, line.drift_secs) {
@@ -785,12 +793,15 @@ impl Strategy for BooklineStrategy {
                         best = Some((side, token.clone(), px, consensus, room, edge));
                     }
                 }
-                Err(why) => last_refusal = why.to_string(),
+                Err(why) => refusals[side] = Some(why.to_string()),
             }
         }
 
         let Some((side, token, price, _consensus, room, edge)) = best else {
-            idle(if last_refusal.is_empty() { "no side worth quoting" } else { &last_refusal });
+            let say = |i: usize| refusals[i].as_deref().unwrap_or("no line");
+            // Both legs named, so the reason the FAVORITE was refused is never
+            // hidden behind the underdog's floor refusal.
+            idle(&format!("no side qualifies | YES: {} | NO: {}", say(0), say(1)));
             return Ok(StrategySignal::NoSignal);
         };
 
