@@ -20,7 +20,7 @@ import { useCallback, useEffect, useState } from 'react';
 import useSWR from 'swr';
 import type { SquadronSummary, SquadronState, DeploymentStatus } from '@/lib/types';
 import { marketLabel } from '@/lib/types';
-import { getOpenPositions, getVipersForClass, getDeployments, retryDeployment, dismissDeployment } from '@/lib/api';
+import { getOpenPositions, getVipersForClass, getSquadronConfig, getDeployments, retryDeployment, dismissDeployment, VIPER_DEFS } from '@/lib/api';
 import DeploySquadronModal from './DeploySquadronModal';
 
 // ── State badge ───────────────────────────────────────────────────────────────
@@ -75,19 +75,25 @@ function timeAgo(iso: string): string {
 // ── Squadron row ──────────────────────────────────────────────────────────────
 
 /**
- * Viper coverage for a squadron's market class.
+ * How many of a squadron's strategies are switched ON.
  *
- * Only crypto markets get the full nine strategies; sports, politics and the
- * `unknown` fallback are mapped to arbitrage + maker only (see the
- * market_class_viper seeding in helpers/db.rs). That is a market-class limit
- * rather than a venue one — it applies identically on Polymarket and Kalshi —
- * and it is invisible today: a customer on a sports market sees seven strategies
- * sit idle with no explanation. This surfaces it on the card.
+ * This used to read "2/9 strategies apply", counting which strategies the market
+ * class SUPPORTS rather than which are running — a sports squadron showed 4/9
+ * because only four vipers can price a game, and the number never moved when the
+ * operator turned one off. Two different facts were competing for one badge, and
+ * the one an operator checks at a glance is whether the squadron is actually
+ * working.
  *
- * The denominator is read from the crypto class rather than hardcoded to 9, so
- * adding a tenth viper updates this automatically.
+ * So the denominator is now what this squadron can run, and the numerator is what
+ * is enabled. Applicability has not been dropped — it moved into the tooltip,
+ * which is where "the rest need a per-market price signal only crypto provides"
+ * belongs.
  */
-function ViperCoverage({ marketClass }: { marketClass: string }) {
+function ViperCoverage({ squadronId, marketClass, vipers }: {
+  squadronId: string;
+  marketClass: string;
+  vipers?: string[];
+}) {
   const { data: mine } = useSWR(
     ['vipers-for-class', marketClass],
     () => getVipersForClass(marketClass as never),
@@ -98,9 +104,42 @@ function ViperCoverage({ marketClass }: { marketClass: string }) {
     () => getVipersForClass('crypto' as never),
     { revalidateOnFocus: false },
   );
+  // Enablement is per squadron, so it comes from the squadron's own config row
+  // rather than the global one.
+  const { data: cfg } = useSWR(
+    ['squadron-config', squadronId],
+    () => getSquadronConfig(squadronId),
+    { revalidateOnFocus: false, refreshInterval: 30_000 },
+  );
   if (!mine || !full || full.length === 0) return null;
 
-  const partial = mine.length < full.length;
+  // What this squadron can run. The squadron's own list when the engine reports
+  // one, else the market class's.
+  const applicable = (vipers && vipers.length > 0)
+    ? mine.filter(v => vipers.includes(v.id))
+    : mine;
+
+  // Enabled is only knowable once the config has loaded; until then say how many
+  // could run rather than guessing at zero, which would read as a dead squadron.
+  const enableKeyFor = (id: string) =>
+    VIPER_DEFS.find(d => d.statusKey === id)?.enableKey;
+  const active = cfg
+    ? applicable.filter(v => {
+        const k = enableKeyFor(v.id);
+        // No enable key means nothing can switch it off.
+        return k ? cfg[k] !== false : true;
+      })
+    : undefined;
+
+  const total = applicable.length;
+  const on = active?.length;
+  // Amber only when something is off. A squadron running everything it can is
+  // healthy even if its class supports fewer strategies than crypto does.
+  const partial = on !== undefined && on < total;
+  const offNames = active && applicable
+    .filter(v => !active.some(a => a.id === v.id))
+    .map(v => v.display);
+
   return (
     <span
       className={`text-[10px] font-mono rounded px-2 py-0.5 border ${
@@ -108,18 +147,18 @@ function ViperCoverage({ marketClass }: { marketClass: string }) {
           ? 'bg-amber-500/10 text-amber-300 border-amber-500/25'
           : 'bg-emerald-500/10 text-emerald-300 border-emerald-500/20'
       }`}
-      title={
-        partial
-          ? `${mine.length} of ${full.length} strategies apply to ${marketClass} markets: ` +
-            `${mine.map(v => v.display).join(', ')}. The rest need a per-market price ` +
-            `signal that only crypto markets provide.`
-          : `All ${full.length} strategies apply to ${marketClass} markets.`
-      }
+      title={[
+        on === undefined
+          ? `${total} strategies apply to ${marketClass} markets.`
+          : `${on} of ${total} strategies active: ${active!.map(v => v.display).join(', ') || 'none'}.`,
+        offNames && offNames.length > 0 ? `Switched off: ${offNames.join(', ')}.` : '',
+        total < full.length
+          ? `${total} of ${full.length} strategies apply to ${marketClass} markets — the rest need a ` +
+            `per-market price signal that only crypto markets provide.`
+          : '',
+      ].filter(Boolean).join(' ')}
     >
-      {/* "strategies apply", not a bare fraction: sitting among health
-          information, "2/9" was read as two of nine vipers running rather than
-          two of nine strategies being applicable to this market class. */}
-      {mine.length}/{full.length} strategies apply
+      {on === undefined ? total : on}/{total} strategies active
     </span>
   );
 }
@@ -174,7 +213,9 @@ function SquadronRow({
               {sq.market_class}
             </span>
           )}
-          {sq.market_class && <ViperCoverage marketClass={sq.market_class} />}
+          {sq.market_class && (
+            <ViperCoverage squadronId={sq.id} marketClass={sq.market_class} vipers={sq.vipers} />
+          )}
           {missionCount !== undefined && missionCount > 0 && (
             <span className="text-[10px] font-mono bg-cyan-500/10 text-cyan-300 border border-cyan-500/20 rounded px-2 py-0.5" title={`${missionCount} active mission${missionCount === 1 ? '' : 's'}`}>
               ✈️ {missionCount}
