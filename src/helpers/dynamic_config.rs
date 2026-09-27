@@ -259,6 +259,7 @@ fn default_bookline_min_consensus() -> Decimal { config::BOOKLINE_MIN_CONSENSUS 
 fn default_bookline_min_books() -> i64 { config::BOOKLINE_MIN_BOOKS }
 fn default_bookline_max_dispersion() -> Decimal { config::BOOKLINE_MAX_DISPERSION }
 fn default_bookline_max_feed_age_secs() -> i64 { config::BOOKLINE_MAX_FEED_AGE_SECS }
+fn default_bookline_pull_feed_age_secs() -> i64 { config::BOOKLINE_PULL_FEED_AGE_SECS }
 fn default_bookline_pull_on_adverse_drift() -> Decimal { config::BOOKLINE_PULL_ON_ADVERSE_DRIFT }
 fn default_bookline_pull_before_start_secs() -> i64 { config::BOOKLINE_PULL_BEFORE_START_SECS }
 fn default_bookline_trade_size_usdc() -> Decimal { config::BOOKLINE_TRADE_SIZE_USDC }
@@ -1150,6 +1151,11 @@ pub struct DynamicConfig {
     pub bookline_max_dispersion: Decimal,
     #[serde(default = "default_bookline_max_feed_age_secs")]
     pub bookline_max_feed_age_secs: i64,
+    /// Staleness that withdraws an ALREADY-RESTING bid, as opposed to the one above
+    /// that refuses to place a new one. Read through `bookline_pull_feed_age()`,
+    /// which will not let it sit below the entry bar.
+    #[serde(default = "default_bookline_pull_feed_age_secs")]
+    pub bookline_pull_feed_age_secs: i64,
     #[serde(default = "default_bookline_pull_on_adverse_drift")]
     pub bookline_pull_on_adverse_drift: Decimal,
     #[serde(default = "default_bookline_pull_before_start_secs")]
@@ -1440,6 +1446,7 @@ impl Default for DynamicConfig {
             bookline_min_books: config::BOOKLINE_MIN_BOOKS,
             bookline_max_dispersion: config::BOOKLINE_MAX_DISPERSION,
             bookline_max_feed_age_secs: config::BOOKLINE_MAX_FEED_AGE_SECS,
+            bookline_pull_feed_age_secs: config::BOOKLINE_PULL_FEED_AGE_SECS,
             bookline_pull_on_adverse_drift: config::BOOKLINE_PULL_ON_ADVERSE_DRIFT,
             bookline_pull_before_start_secs: config::BOOKLINE_PULL_BEFORE_START_SECS,
             bookline_trade_size_usdc: config::BOOKLINE_TRADE_SIZE_USDC,
@@ -1609,6 +1616,15 @@ impl DynamicConfig {
     /// patrol reads the knob.
     pub fn exit_retry_cooldown_secs_floored(&self) -> u64 {
         self.exit_retry_cooldown_secs.max(EXIT_RETRY_COOLDOWN_FLOOR_SECS)
+    }
+
+    /// Staleness at which a resting Bookline bid is withdrawn, never tighter than
+    /// the staleness that would refuse to place it. Set the other way round, the
+    /// viper would quote and then pull on the very next tick, churning the book and
+    /// paying the spread for nothing -- so the entry bar is the floor here rather
+    /// than a validation error the operator has to discover from behavior.
+    pub fn bookline_pull_feed_age(&self) -> i64 {
+        self.bookline_pull_feed_age_secs.max(self.bookline_max_feed_age_secs)
     }
 }
 
@@ -2111,6 +2127,7 @@ mod tests {
             "bookline_min_books",
             "bookline_max_dispersion",
             "bookline_max_feed_age_secs",
+            "bookline_pull_feed_age_secs",
             "bookline_pull_on_adverse_drift",
             "bookline_pull_before_start_secs",
             "bookline_trade_size_usdc",

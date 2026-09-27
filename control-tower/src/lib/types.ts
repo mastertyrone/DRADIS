@@ -250,6 +250,7 @@ export interface DynamicConfig {
   bookline_min_books?: number;
   bookline_max_dispersion?: string;
   bookline_max_feed_age_secs?: number;
+  bookline_pull_feed_age_secs?: number;
   bookline_pull_on_adverse_drift?: string;
   bookline_pull_before_start_secs?: number;
   bookline_trade_size_usdc?: string;

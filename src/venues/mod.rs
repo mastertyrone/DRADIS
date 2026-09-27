@@ -263,7 +263,13 @@ pub fn sports_catalog() -> std::sync::Arc<dyn crate::raptors::sports_ledger::Spo
 /// it is not guessed at here.
 #[cfg(feature = "us_retail")]
 pub fn sports_catalog() -> std::sync::Arc<dyn crate::raptors::sports_ledger::SportsCatalog> {
-    std::sync::Arc::new(crate::raptors::sports_ledger::NoSportsCatalog)
+    // Connects lazily: the ledger spawns before the trading venue exists, and this
+    // selector is sync while `UsRetailVenue::connect` is not. Without credentials or
+    // a reachable gateway the catalog answers nothing, which shows as zero coverage
+    // in the telemetry rather than failing at boot.
+    std::sync::Arc::new(crate::venues::us::sports::UsSportsCatalog::new(
+        std::sync::Arc::new(reqwest::Client::new()),
+    ))
 }
 
 /// The price grid the venue's sports game markets quote on.

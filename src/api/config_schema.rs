@@ -1066,9 +1066,18 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
         v.push(F::new(bl, None, "bookline_max_dispersion", "Max Dispersion", "price", true,
             "Widest book disagreement Bookline will quote into. Wide dispersion is news in flight, and a \
              resting bid is the wrong side of news."));
-        v.push(F::new(bl, None, "bookline_max_feed_age_secs", "Max Feed Age", "secs", true,
-            "Oldest consensus Bookline will quote against. Also a pull reason: a bid already resting comes off \
-             when the feed behind it goes stale.").min(30.0).step(30.0).unit("s"));
+        v.push(F::new(bl, None, "bookline_max_feed_age_secs", "Max Feed Age To Quote", "secs", true,
+            "Oldest consensus Bookline will PLACE a bid against. This governs entry only; what withdraws a bid \
+             already resting is Max Feed Age To Hold, which is deliberately looser.").min(30.0).step(30.0).unit("s"));
+        v.push(F::new(bl, None, "bookline_pull_feed_age_secs", "Max Feed Age To Hold", "secs", true,
+            "Oldest consensus that still leaves an already-resting bid in the book. Committing new capital \
+             demands a current line, but a bid resting at a price that WAS current when placed is not made \
+             wrong by the feed going quiet, and sharing one threshold with entry capped a quote's life at the \
+             entry bar -- far too short for a passive maker to be crossed, which turned the pre-game window \
+             into a sequence of pulls. Keep this comfortably above the widest gap in the sports ledger's \
+             snapshot schedule. Setting it below Max Feed Age To Quote has no effect: that value is the \
+             floor, since quoting and pulling on the same tick would only churn the book.")
+            .min(30.0).step(60.0).unit("s"));
         v.push(F::new(bl, None, "bookline_pull_on_adverse_drift", "Pull On Adverse Drift", "price", true,
             "How far the consensus may move AGAINST a resting bid before it is pulled, in probability points. \
              A cancel is free, so this is deliberately trigger-happy: the asymmetry between an unfilled pull \

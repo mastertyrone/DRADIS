@@ -33,6 +33,7 @@
 
 pub mod auth;
 pub mod markets;
+pub mod sports;
 pub mod trader;
 pub mod types;
 pub mod ws;
@@ -184,6 +185,54 @@ impl UsRetailVenue {
     /// the whole response fails to deserialize.  Using a raw HTTP call lets us parse
     /// into our own lenient `types::MarketsResponse` where `outcomes: Value` accepts
     /// any JSON shape without error.
+    /// Gateway base URL, signer and client for the sports catalog.
+    ///
+    /// The catalog needs a signed read the typed helpers do not expose: it wants the
+    /// RAW market records, because `UsMarketPair` drops the two fields it depends on
+    /// — the per-side `team` objects and `gameStartTime`. Every read on this venue is
+    /// signed, so there is no public path to use instead.
+    pub fn base_url_for_sports(&self) -> &str { &self.base_url }
+    pub fn auth_for_sports(&self) -> &UsAuth { &self.auth }
+    pub fn http_for_sports(&self) -> &reqwest::Client { &self.http }
+
+    /// Best bid and ask for one leg, as the sports ledger wants them.
+    ///
+    /// Same BBO call `best_ask` uses; this returns both sides with their sizes, and
+    /// `None` only when the query itself fails. A missing level stays `None` rather
+    /// than becoming a zero, because a zero bid reads as a real price downstream.
+    pub async fn bbo_for_sports(
+        &self,
+        leg_symbol: &str,
+    ) -> Option<(Option<f64>, Option<f64>, Option<f64>, Option<f64>)> {
+        use rust_decimal::prelude::ToPrimitive;
+        let bbo = self.client.markets().bbo(leg_symbol).await.ok()?;
+        let num = |s: &str| Decimal::from_str(s.trim()).ok().and_then(|d| d.to_f64());
+        // `quantity`, not `size` — the SDK's own field name for the level's depth.
+        let lvl = |l: &Option<polymarket_us::types::PriceLevel>| -> (Option<f64>, Option<f64>) {
+            match l {
+                Some(x) => (num(&x.price), num(&x.quantity)),
+                None => (None, None),
+            }
+        };
+        let (bid, bid_sz) = lvl(&bbo.bid);
+        let (ask, ask_sz) = lvl(&bbo.ask);
+        Some((bid, bid_sz, ask, ask_sz))
+    }
+
+    /// The venue's own resolution for one leg, for the sports ledger's results pass.
+    pub async fn settlement_for_sports(
+        &self,
+        leg_symbol: &str,
+    ) -> crate::venues::core::TokenResolution {
+        self.settlement_resolution(leg_symbol).await
+    }
+
+    /// Test-only aliases, kept so the capture test reads as what it is.
+    #[cfg(test)]
+    pub fn base_url_for_tests(&self) -> &str { self.base_url_for_sports() }
+    #[cfg(test)]
+    pub fn auth_for_tests(&self) -> &UsAuth { self.auth_for_sports() }
+
     pub async fn discover_binary_markets(&self) -> Result<Vec<markets::UsMarketPair>> {
         self.discover_binary_markets_filtered(&[], None).await
     }

@@ -539,6 +539,66 @@ mod tests {
         assert_eq!(pull_reason(Ok(()), dec!(-0.05), dec!(0.01)), None);
     }
 
+    /// The defect this pair of thresholds exists to prevent: a quote that cannot
+    /// outlive the gap between two scheduled snapshots. Bookline is a passive maker,
+    /// so its bid has to sit in the book long enough for the market to cross it, and
+    /// re-running the ENTRY staleness bar on every tick of a resting bid capped that
+    /// life at ten minutes. Measured on Kalshi against a schedule with 60- and
+    /// 30-minute holes, a quote could hold for 35 of the 105 pre-game minutes in
+    /// three disjoint pieces, every piece ending in a pull rather than a fill, and no
+    /// Bookline row was ever written on any venue.
+    ///
+    /// So the schedule and the pull bar are one design, and this asserts they still
+    /// agree: no scheduled gap, even with the snapshot landing as late as its window
+    /// allows, may age a line past the bar that withdraws a resting bid.
+    #[test]
+    fn the_snapshot_schedule_cannot_by_itself_pull_a_resting_bid() {
+        use crate::raptors::sports_ledger::{parse_offsets_mins, snapshot_timing};
+
+        let offsets = parse_offsets_mins(crate::config::SPORTS_LEDGER_SNAPSHOT_OFFSETS_MINS);
+        assert!(offsets.len() > 1, "a schedule of one offset is not a cadence");
+
+        let mut sorted = offsets.clone();
+        sorted.sort_unstable();
+        let widest_gap_secs =
+            sorted.windows(2).map(|w| (w[1] - w[0]) * 60).max().expect("more than one offset");
+
+        // A target is honored anywhere inside its window, so the worst case is a
+        // snapshot landing at the far edge of one and the next at the near edge.
+        let (window_secs, _) = snapshot_timing(&offsets);
+        let worst_age_secs = widest_gap_secs + window_secs;
+
+        assert!(
+            worst_age_secs <= crate::config::BOOKLINE_PULL_FEED_AGE_SECS,
+            "the schedule's widest gap ({widest_gap_secs}s, up to {worst_age_secs}s with slip) \
+             outlives BOOKLINE_PULL_FEED_AGE_SECS ({}s), so the cadence alone would pull every \
+             resting bid -- widen the pull bar or tighten the offsets",
+            crate::config::BOOKLINE_PULL_FEED_AGE_SECS,
+        );
+    }
+
+    /// The pull bar is never allowed to sit tighter than the entry bar. Set that way
+    /// round, Bookline would place a bid and withdraw it on the very next tick,
+    /// paying the spread to churn the book -- a shape an operator would only ever
+    /// discover from behavior, so the accessor clamps instead of trusting the value.
+    #[test]
+    fn the_pull_bar_is_never_tighter_than_the_bar_that_placed_the_bid() {
+        let mut dc = crate::helpers::dynamic_config::DynamicConfig::default();
+
+        // The shipped defaults are already the right way round.
+        assert!(dc.bookline_pull_feed_age() >= dc.bookline_max_feed_age_secs);
+        assert_eq!(dc.bookline_pull_feed_age(), crate::config::BOOKLINE_PULL_FEED_AGE_SECS);
+
+        // An operator inverting them gets the entry bar, not a self-cancelling quote.
+        dc.bookline_max_feed_age_secs = 900;
+        dc.bookline_pull_feed_age_secs = 60;
+        assert_eq!(dc.bookline_pull_feed_age(), 900);
+
+        // A deliberately looser value is still honored.
+        dc.bookline_pull_feed_age_secs = 5_400;
+        assert_eq!(dc.bookline_pull_feed_age(), 5_400);
+    }
+
     #[test]
     fn the_take_profit_sits_above_the_entry_the_bid_and_below_a_dollar() {
         assert_eq!(resting_tp_price(dec!(0.60), dec!(0.03), dec!(0.55), dec!(0.56), dec!(0.01)), Some(dec!(0.63)));
@@ -903,13 +963,25 @@ impl Strategy for BooklineStrategy {
 
             if row.filled_at.is_none() {
                 // ── Resting: pull, or let the book cross us ────────────────────
+                //
+                // The same gate as entry, with ONE threshold swapped: staleness is
+                // measured against the looser pull bar. Placing capital demands a
+                // current line; a bid already resting at a price that was current
+                // when placed is not made wrong by the feed going quiet, and sharing
+                // the entry bar here meant a quote outlived its line by ten minutes
+                // and no longer. Against a ledger that snapshotted 60 minutes apart
+                // at the far end of the window, that turned the whole pre-game
+                // window into a sequence of pulls and no Bookline row was ever
+                // written on any venue. Every other refusal still pulls: a longshot
+                // consensus, books that have scattered, or kick-off arriving are all
+                // reasons to be out of the book regardless of when they appeared.
                 let verdict = match line.as_ref() {
                     Some(l) => line_usable(
                         Decimal::try_from(l.consensus).unwrap_or(Decimal::ZERO), None, l.num_books,
                         l.dispersion.and_then(|d| Decimal::try_from(d).ok()),
                         l.age_secs(now), l.secs_to_start(now), dc.bookline_min_consensus,
                         dc.bookline_min_books, dc.bookline_max_dispersion,
-                        dc.bookline_max_feed_age_secs, dc.bookline_pull_before_start_secs,
+                        dc.bookline_pull_feed_age(), dc.bookline_pull_before_start_secs,
                     ),
                     None => Err(LineRefusal::NoLine),
                 };

@@ -593,3 +593,71 @@ mod fee_coefficient_tests {
         assert_eq!(free.fee_coefficient, Some(Decimal::ZERO), "an explicit zero survives as one");
     }
 }
+
+#[cfg(all(test, feature = "us_retail"))]
+mod moneyline_capture {
+    /// Capture what a Polymarket US game moneyline actually looks like, so the
+    /// sports catalog adapter can be written against a record rather than a guess.
+    ///
+    /// The one fact the adapter cannot proceed without is WHICH SIDE the `long` leg
+    /// pays on. Get it backwards and every line on the venue is inverted: the board
+    /// would price the favorite's consensus against the underdog's book, the
+    /// implausible-gap guard would fire on every market, and the failure would look
+    /// like a matcher bug rather than a polarity error.
+    ///
+    /// The only captured record in the tree is a `futures` market, whose
+    /// `marketSides` entries carry `description`, `id`, `identifier`, `long`,
+    /// `marketSideType` and `price` — no structured team object. Whether a moneyline
+    /// adds one, and whether `description` names the team plainly, is what this
+    /// prints.
+    ///
+    /// Run with:
+    ///   cargo test --no-default-features --features us_retail \
+    ///     capture_a_live_moneyline_record -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "live venue: needs POLYMARKET_US_KEY_ID and POLYMARKET_US_SECRET_KEY"]
+    async fn capture_a_live_moneyline_record() {
+        use crate::venues::us::UsRetailVenue;
+        use std::sync::Arc;
+
+        let http = Arc::new(reqwest::Client::new());
+        let venue = UsRetailVenue::connect(http.clone()).await.expect("venue connect");
+
+        // Signed, like every other read on this venue: there is no public path.
+        let path = "/v1/markets";
+        let url = format!("{}{}?categories=sports&limit=200&page=1", venue.base_url_for_tests(), path);
+        let signed = venue.auth_for_tests().signed_headers("GET", path);
+        let text = http.get(&url)
+            .header(signed[0].0, &signed[0].1)
+            .header(signed[1].0, &signed[1].1)
+            .header(signed[2].0, &signed[2].1)
+            .header("Content-Type", "application/json")
+            .send().await.expect("request").text().await.expect("body");
+
+        let v: serde_json::Value = serde_json::from_str(&text).expect("json");
+        let markets = v.get("markets").and_then(|m| m.as_array()).cloned().unwrap_or_default();
+        eprintln!("sports markets returned: {}", markets.len());
+
+        let moneylines: Vec<&serde_json::Value> = markets.iter()
+            .filter(|m| m.get("marketType").and_then(|t| t.as_str())
+                .is_some_and(|t| t.eq_ignore_ascii_case("moneyline")))
+            .collect();
+        eprintln!("of which moneylines: {}", moneylines.len());
+
+        let Some(m) = moneylines.first() else {
+            eprintln!("NO MONEYLINE IN THE LISTING — the adapter's polarity question stays open.");
+            eprintln!("market types seen: {:?}", markets.iter()
+                .filter_map(|m| m.get("marketType").and_then(|t| t.as_str()))
+                .collect::<std::collections::BTreeSet<_>>());
+            return;
+        };
+
+        for k in ["slug", "question", "title", "marketType", "gameStartTime", "endDate", "category"] {
+            eprintln!("  {k} = {}", m.get(k).map(|v| v.to_string()).unwrap_or_else(|| "—".into()));
+        }
+        eprintln!("  marketSides:");
+        for s in m.get("marketSides").and_then(|s| s.as_array()).cloned().unwrap_or_default() {
+            eprintln!("    {}", serde_json::to_string(&s).unwrap_or_default());
+        }
+    }
+}

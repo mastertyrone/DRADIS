@@ -785,7 +785,8 @@ pub const SPORTS_LEDGER_LEAGUES: &str = "mlb=baseball_mlb,nfl=americanfootball_n
 ///
 /// Budget: about four times the old schedule, which at the observed ~60 credits a
 /// day is roughly 240 a day against a 100,000-a-month plan.
-pub const SPORTS_LEDGER_SNAPSHOT_OFFSETS_MINS: &str = "-120,-60,-30,-25,-20,-15,-10,-5";
+pub const SPORTS_LEDGER_SNAPSHOT_OFFSETS_MINS: &str =
+    "-120,-110,-100,-90,-80,-70,-60,-50,-40,-30,-25,-20,-15,-10,-5";
 /// Odds API credits the ledger never spends into.
 pub const SPORTS_LEDGER_CREDIT_RESERVE: i64 = 25;
 // ── Sports consumers: the board as a trading signal ─────────────────────────
@@ -878,6 +879,11 @@ pub const BOOKLINE_MIN_BOOKS: i64 = 5;
 pub const BOOKLINE_MAX_DISPERSION: Decimal = dec!(0.06);
 /// Oldest consensus Bookline will quote against, in seconds.
 pub const BOOKLINE_MAX_FEED_AGE_SECS: i64 = 600;
+/// Oldest consensus that still leaves an already-resting bid in the book, in
+/// seconds. Far looser than `BOOKLINE_MAX_FEED_AGE_SECS` on purpose: committing new
+/// capital demands a current line, but a bid already resting at a price that WAS
+/// current when placed is not made wrong by the feed going quiet.
+pub const BOOKLINE_PULL_FEED_AGE_SECS: i64 = 2700;
 /// Adverse consensus movement, in points, that pulls a resting bid.
 pub const BOOKLINE_PULL_ON_ADVERSE_DRIFT: Decimal = dec!(0.01);
 /// Seconds before kick-off at which Bookline stops quoting and pulls. The free
