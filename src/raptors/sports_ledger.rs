@@ -751,6 +751,50 @@ pub fn match_games(pm: &[PmGame], odds: &[OddsEvent], sport_key: &str) -> Vec<Ma
 
 // ── Scheduling and budget ────────────────────────────────────────────────────
 
+/// How much of a candidate slate the board can actually price, and which entry is
+/// the best pre-game one.
+///
+/// A sports viper prices from the bookmaker board, so a squadron deployed on a game
+/// the board does not cover is a squadron that cannot trade — it patrols, reports
+/// "no bookmaker line", and holds the venue's one sports slot while doing it. The
+/// selector therefore has to ask the board BEFORE it picks, not after.
+///
+/// Polymarket International has had this rule since the sports seeder was written.
+/// Kalshi's selector picked purely by volume, so on 2026-09-26 it chose a college
+/// football game while the board held only MLB, and Bookline idled on a perfectly
+/// good adapter for want of a line. Venue-neutral here, over `(yes_id, no_id,
+/// liquidity)`, so all three seeders can share one rule rather than each growing
+/// its own version of it.
+///
+/// Pre-game only: the free bookmaker feed stops once a game starts, and the pull
+/// rules go idle on a negative clock, so a squadron seeded in play is the
+/// looks-busy-does-nothing trade with the signal missing rather than the book.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BoardCoverage {
+    /// Index of the best pre-game candidate the board can price, by liquidity.
+    pub best: Option<usize>,
+    /// How many candidates the board holds a line for at all.
+    pub on_board: usize,
+    /// How many of those have not started yet.
+    pub pre_game: usize,
+}
+
+pub fn board_coverage(
+    candidates: &[(String, String, f64)],
+    board: &SportsBoard,
+    now: DateTime<Utc>,
+) -> BoardCoverage {
+    let line = |c: &(String, String, f64)| board.get(&c.0).or_else(|| board.get(&c.1));
+    let on_board = candidates.iter().filter(|c| line(c).is_some()).count();
+    let pre: Vec<usize> = candidates.iter().enumerate()
+        .filter(|(_, c)| line(c).is_some_and(|l| l.commence > now))
+        .map(|(i, _)| i)
+        .collect();
+    let best = pre.iter().copied()
+        .max_by(|&a, &b| candidates[a].2.total_cmp(&candidates[b].2));
+    BoardCoverage { best, on_board, pre_game: pre.len() }
+}
+
 /// Sport keys with a snapshot due now: some matched game has reached one of the
 /// offsets from its start within the derived snapshot window, and that sport has
 /// not been snapshotted within the derived coalesce window before the target
@@ -1835,6 +1879,56 @@ mod tests {
     }
 
     #[test]
+    /// A sports squadron must land on a game the board can price.
+    ///
+    /// Kalshi's selector picked purely by volume, so on 2026-09-26 it chose a
+    /// college football game while the board held only MLB: the adapter was
+    /// working, 68 lines were on the board, and Bookline reported "no bookmaker
+    /// line" because the one market it was given was not one of them. A squadron on
+    /// an uncovered game also holds the venue's single sports slot while doing
+    /// nothing, so idle is strictly better than deployed-and-mute.
+    #[test]
+    fn the_seeder_only_picks_games_the_board_can_price() {
+        let now = Utc::now();
+        let line = |commence| SportsLine {
+            league: "mlb".into(), sport_key: "baseball_mlb".into(), odds_event_id: "e".into(),
+            commence, outcome_label: "Team".into(), consensus: 0.6, num_books: 6,
+            dispersion: Some(0.02), max_book_age_secs: Some(30), odds_at: now,
+            drift: None, drift_secs: None,
+        };
+        let mut board = SportsBoard::new();
+        board.insert("covered#yes".into(), line(now + ChronoDuration::hours(2)));
+        board.insert("started#yes".into(), line(now - ChronoDuration::hours(1)));
+
+        // Liquidity decides only among the games the board can price. The busiest
+        // game on the slate loses to a quieter one that actually has a line.
+        let c = vec![
+            ("uncovered#yes".to_string(), "uncovered#no".to_string(), 9_000_000.0),
+            ("covered#yes".to_string(),   "covered#no".to_string(),      50_000.0),
+        ];
+        let cov = board_coverage(&c, &board, now);
+        assert_eq!(cov.best, Some(1), "the covered game wins however thin it is");
+        assert_eq!((cov.on_board, cov.pre_game), (1, 1));
+
+        // A game already under way is not a candidate: the free feed stops at
+        // kick-off and the pull rules go idle on a negative clock.
+        let c = vec![("started#yes".to_string(), "started#no".to_string(), 1_000.0)];
+        let cov = board_coverage(&c, &board, now);
+        assert_eq!(cov.best, None, "in-play is not seedable on a pre-game feed");
+        assert_eq!((cov.on_board, cov.pre_game), (1, 0), "on the board, but not pre-game");
+
+        // Nothing covered means no deployment at all. Idle beats a squadron that
+        // holds the sports slot and cannot trade.
+        let c = vec![("nope#yes".to_string(), "nope#no".to_string(), 5.0)];
+        assert_eq!(board_coverage(&c, &board, now).best, None);
+        assert_eq!(board_coverage(&[], &board, now).best, None);
+
+        // Either leg matching is enough — Kalshi keys a game under four legs and a
+        // squadron may be handed the market from either team's side.
+        let c = vec![("x#yes".to_string(), "covered#yes".to_string(), 10.0)];
+        assert_eq!(board_coverage(&c, &board, now).best, Some(0), "the NO leg found the line");
+    }
+
     /// The snapshot cadence must follow the operator's offsets, not cap them.
     ///
     /// Fixed at 20 and 30 minutes, the coalesce window swallowed every offset

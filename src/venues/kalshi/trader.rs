@@ -740,6 +740,47 @@ async fn select_auto_deploy_market(
 
     let now = Utc::now();
     let max_secs = max_days_to_close as i64 * 86_400;
+
+    // A sports squadron must land on a game the bookmaker board can PRICE, not
+    // merely the busiest game on the slate. The board is what every sports viper
+    // reads, so a squadron on an uncovered game patrols, reports "no bookmaker
+    // line" and holds the venue's one sports slot while doing nothing. Measured
+    // 2026-09-26: this selector picked a college football game while the board held
+    // only MLB, and Bookline idled on a working adapter for want of a line.
+    //
+    // Polymarket International has had this rule since its sports seeder was
+    // written; `board_coverage` is that rule, lifted somewhere all three venues can
+    // share it.
+    if class == "sports" {
+        let board = crate::raptors::sports_ledger::board();
+        let candidates: Vec<(String, String, f64)> = found.iter().map(|m| (
+            crate::venues::kalshi::leg_id(&m.ticker, true),
+            crate::venues::kalshi::leg_id(&m.ticker, false),
+            crate::venues::kalshi::types::fp(&m.volume_fp)
+                .and_then(|d| f64::try_from(d).ok()).unwrap_or(0.0),
+        )).collect();
+        let cov = crate::raptors::sports_ledger::board_coverage(&candidates, &board, now);
+        match cov.best {
+            Some(i) => {
+                info!(
+                    "📋 Kalshi sports: {} of {} game(s) on the bookmaker board, {} pre-game — \
+                     selecting {}",
+                    cov.on_board, found.len(), cov.pre_game, found[i].ticker,
+                );
+                return Some(found[i].ticker.clone());
+            }
+            None => {
+                info!(
+                    "📋 Kalshi sports: none of {} open game(s) are on the bookmaker board pre-game \
+                     ({} on board, {} pre-game) — leaving the sports slot idle rather than deploying \
+                     onto a game nothing can price",
+                    found.len(), cov.on_board, cov.pre_game,
+                );
+                return None;
+            }
+        }
+    }
+
     let mut best: Option<(f64, String)> = None;
     for m in found {
         if let Some(ct) = m.close_time_utc() {
