@@ -85,10 +85,47 @@ pub fn league_from_series(series: &str) -> Option<String> {
     let core = s.strip_prefix("KX")?;
     for suffix in ["GAME", "MATCH", "FIGHT"] {
         if let Some(code) = core.strip_suffix(suffix) {
-            return (!code.is_empty()).then(|| code.to_ascii_lowercase());
+            if code.is_empty() { return None; }
+            let native = code.to_ascii_lowercase();
+            // Kalshi's own league abbreviations are not always the ones the shared
+            // `sports_ledger_leagues` knob uses, and a mismatch is silent: the
+            // league simply never appears in `by_league`, so it reads as "no games"
+            // rather than as a naming gap. College football was exactly this —
+            // `KXNCAAFGAME` yields `ncaaf` while the knob has always said `cfb`, so
+            // it could never have matched a single game.
+            return Some(match native.as_str() {
+                "ncaaf" => "cfb".to_string(),
+                "ncaamb" => "cbb".to_string(),
+                other => other.to_string(),
+            });
         }
     }
     None
+}
+
+/// How long after kick-off a Kalshi game market is expected to expire.
+///
+/// Used only for tickers that carry no time. Observed on live records: the NFL
+/// game `KXNFLGAME-26OCT05ATLNO` expires `2026-10-06T03:15Z`, three hours after a
+/// 20:15 ET Sunday kick-off, and MLB's stamped tickers agree with the same offset.
+///
+/// An estimate, and the coverage line is how a league where it is wrong becomes
+/// visible: the matcher tolerates 15 minutes, so a sport whose games do not run
+/// about three hours would show as matched 0 of N rather than failing silently.
+const EXPIRY_AFTER_KICKOFF_SECS: i64 = 3 * 3600;
+
+/// Kick-off for one Kalshi game market.
+///
+/// Prefers the ticker's own stamp, which is exact — but only some series carry one.
+/// MLB writes `26SEP261915CHCBOS` (date, time, teams) while NFL writes
+/// `26OCT05ATLNO` (date, teams). Reading the NFL form with the MLB parser takes
+/// `ATLN` as `HHMM`, fails, and drops the ENTIRE league: five NFL games were open
+/// on 2026-09-27 and not one reached the board, which read identically to "the NFL
+/// has no games today".
+pub fn kickoff_for(event_ticker: &str, expected_expiration: Option<DateTime<Utc>>) -> Option<DateTime<Utc>> {
+    kickoff_from_ticker(event_ticker).or_else(|| {
+        expected_expiration.map(|e| e - chrono::Duration::seconds(EXPIRY_AFTER_KICKOFF_SECS))
+    })
 }
 
 /// Add each market's mirror leg to a matched game.
@@ -151,7 +188,11 @@ impl SportsCatalog for KalshiSportsCatalog {
             // Exactly two team markets is a moneyline. Anything else on a game
             // series is a prop or a three-way and not this instrument.
             if legs.len() != 2 { continue; }
-            let Some(commence) = kickoff_from_ticker(&event) else { continue };
+            let expiry = legs.iter().find_map(|m| {
+                chrono::DateTime::parse_from_rfc3339(&m.expected_expiration_time)
+                    .ok().map(|d| d.with_timezone(&Utc))
+            });
+            let Some(commence) = kickoff_for(&event, expiry) else { continue };
             let Some(league) = league_from_series(event.split_once('-').map(|(s, _)| s).unwrap_or(&event))
             else { continue };
             let outcomes: Vec<PmOutcome> = legs.iter().map(|m| PmOutcome {
@@ -171,15 +212,33 @@ impl SportsCatalog for KalshiSportsCatalog {
         // The Odds API half and the matcher are venue-neutral and shared.
         let mut out = Vec::new();
         let mut remaining = None;
+        // Per-league coverage, for the reason the intl catalog logs it: a league
+        // that MATCHES nothing is indistinguishable from a league with no games
+        // once both are summed into a total. Without this line, "only MLB is on
+        // the board" could mean the matcher is broken on college football or that
+        // no college football was in the window, and the operator cannot tell
+        // which. Observed 2026-09-27: exactly that question, unanswerable.
+        let mut coverage: Vec<String> = Vec::new();
         for (code, sport_key) in leagues {
-            let Some(games) = by_league.get(code) else { continue };
+            let Some(games) = by_league.get(code) else {
+                coverage.push(format!("{code} n/a (no Kalshi game series)"));
+                continue;
+            };
             let (events, rem) =
                 crate::raptors::sports_ledger::odds_events_for_sport(http, api_key, sport_key).await;
             if rem.is_some() { remaining = rem; }
             let events: Vec<OddsEvent> = events;
-            for g in match_games(games, &events, sport_key) {
+            let matched = match_games(games, &events, sport_key);
+            coverage.push(format!("{code} {}/{}", matched.len(), games.len()));
+            for g in matched {
                 out.push(with_mirror_legs(g));
             }
+        }
+        if !coverage.is_empty() {
+            tracing::info!(
+                "🏈 Sports ledger coverage (matched/Kalshi games): {}",
+                coverage.join(" · "),
+            );
         }
         (out, remaining)
     }
@@ -256,6 +315,50 @@ mod tests {
         assert!(kickoff_from_ticker("KXMLBGAME-26XXX261915CHCBOS").is_none(), "bad month");
         assert!(kickoff_from_ticker("KXMLBGAME-XX SEP261915").is_none(), "bad year");
         assert!(kickoff_from_ticker("").is_none());
+    }
+
+    /// A ticker with no time must still yield a kick-off, or the whole league drops.
+    ///
+    /// MLB stamps `26SEP261915CHCBOS` (date, time, teams); NFL stamps
+    /// `26OCT05ATLNO` (date, teams). Reading the NFL form with the MLB parser takes
+    /// `ATLN` as `HHMM` and fails, and because a game with no start cannot be
+    /// matched, the league never enters the board at all. On 2026-09-27 five NFL
+    /// games were open and none reached the board, which looked exactly like "no NFL
+    /// games today".
+    #[test]
+    fn a_timeless_ticker_falls_back_to_the_expiry() {
+        use chrono::Duration;
+        // A stamped ticker is exact and the expiry is not consulted.
+        let exact = kickoff_for("KXMLBGAME-26SEP261915CHCBOS", Some(Utc::now()));
+        assert_eq!(exact.map(|t| t.to_rfc3339()).as_deref(), Some("2026-09-26T23:15:00+00:00"));
+
+        // A timeless ticker derives kick-off from the expiry, three hours back.
+        let expiry = chrono::DateTime::parse_from_rfc3339("2026-10-06T03:15:00Z")
+            .unwrap().with_timezone(&Utc);
+        let derived = kickoff_for("KXNFLGAME-26OCT05ATLNO", Some(expiry)).expect("derived");
+        assert_eq!(derived, expiry - Duration::hours(3), "20:15 ET Sunday");
+        // And it lands on the date the ticker names, which is the sanity check that
+        // the three-hour offset is the right shape.
+        assert_eq!(derived.to_rfc3339(), "2026-10-06T00:15:00+00:00");
+
+        // Neither source means no game: dropped, never guessed.
+        assert_eq!(kickoff_for("KXNFLGAME-26OCT05ATLNO", None), None);
+    }
+
+    /// Kalshi's league abbreviations are not always the shared knob's, and a
+    /// mismatch is silent — the league simply never appears, reading as "no games".
+    #[test]
+    fn kalshi_league_codes_are_aliased_onto_the_shared_ones() {
+        // The bug: the knob has always said `cfb`, Kalshi says NCAAF.
+        assert_eq!(league_from_series("KXNCAAFGAME").as_deref(), Some("cfb"));
+        assert_eq!(league_from_series("KXNCAAMBGAME").as_deref(), Some("cbb"));
+        // The ones that already agreed must not move.
+        for (series, code) in [("KXMLBGAME", "mlb"), ("KXNFLGAME", "nfl"),
+                               ("KXNBAGAME", "nba"), ("KXNHLGAME", "nhl"),
+                               ("KXEPLGAME", "epl"), ("KXMLSGAME", "mls"),
+                               ("KXUCLGAME", "ucl")] {
+            assert_eq!(league_from_series(series).as_deref(), Some(code), "{series}");
+        }
     }
 
     /// League codes are normalized to the ones Polymarket already uses, so the
