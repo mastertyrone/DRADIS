@@ -879,6 +879,33 @@ async fn get_vipers_status(Query(q): Query<AssetQuery>) -> Response {
     Json(crate::helpers::viper_status::snapshot(q.asset.as_deref())).into_response()
 }
 
+/// GET /api/bookline/record
+///
+/// Bookline's simulated record, one summary PER LANE and never summed. The
+/// squadron lane sees the venue book at tick cadence on the one market its
+/// squadron holds; the board lane sees a ledger snapshot every few minutes on
+/// every pre-game market the board prices. The second is a floor under the
+/// first, not a second sample of it, so a combined figure would mean nothing.
+async fn get_bookline_record() -> Response {
+    let Some(primary) = crate::helpers::db::pool() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "database not ready").into_response();
+    };
+    // The board lane writes where the ledger does: the primary pool. The squadron
+    // lane writes to its squadron's shard, which every venue aliases under its
+    // sports scope ("sports" on Polymarket International and Kalshi; Polymarket US
+    // keeps its sports wing on its own "us-sports" shard). Fall back to the
+    // primary pool when no such alias exists, which is where the intl squadron
+    // lands anyway.
+    let squadron_pool = ["sports", "us-sports"].iter()
+        .find_map(|a| crate::helpers::db::pool_for(a))
+        .unwrap_or_else(|| primary.clone());
+    let lanes = vec![
+        crate::helpers::db::bookline_shadow_lane_summary(&squadron_pool, crate::helpers::db::BOOKLINE_LANE_SQUADRON).await,
+        crate::helpers::db::bookline_shadow_lane_summary(primary, crate::helpers::db::BOOKLINE_LANE_BOARD).await,
+    ];
+    Json(serde_json::json!({ "lanes": lanes })).into_response()
+}
+
 /// GET /api/gboost/planb/status?asset=btc
 ///
 /// The GBoost plan-B training pipeline's full state for one asset: backfill
@@ -4465,6 +4492,7 @@ pub async fn run_api_server(
         .route("/api/logs",                  get(get_logs))
         .route("/api/latency",               get(get_latency))
         .route("/api/vipers/status",         get(get_vipers_status))
+        .route("/api/bookline/record",       get(get_bookline_record))
         .route("/api/gboost/planb/status",   get(get_gboost_planb_status))
         .route("/api/positions",             get(get_open_positions))
         .route("/api/positions/pending",     get(get_pending_positions))

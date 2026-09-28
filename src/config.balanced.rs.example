@@ -873,6 +873,17 @@ pub const BOOKLINE_MAX_OPEN_MARKETS: usize = 3;
 /// Edge above consensus for the resting take-profit ask. Settlement is the plan;
 /// this is the bonus when the market will pay the consensus plus an edge early.
 pub const BOOKLINE_RESTING_TP_EDGE: Decimal = dec!(0.03);
+/// Run Bookline's board lane: the same quoting rule applied to EVERY pre-game
+/// market the sports ledger prices, off the ledger's own snapshots, not only the
+/// one market the sports squadron happens to hold. Simulated, like the squadron
+/// lane, and written to the same ledger under `lane = 'board'`; it never reaches a
+/// venue. Inert without the sports ledger, which is its only source of rows.
+pub const BOOKLINE_BOARD_LANE_ENABLED: bool = true;
+/// Most markets the board lane may hold at once. A sanity bound, not a risk
+/// control: nothing here is capital, and the squadron lane's cap of a few markets
+/// would defeat the point of measuring the whole board. Sized to a full evening
+/// slate across every league the ledger follows.
+pub const BOOKLINE_BOARD_MAX_OPEN_MARKETS: usize = 60;
 
 /// Widest book disagreement FairValue will enter on. A wide line is a soft
 /// line: the books do not know the price, so neither does the consensus.

@@ -257,6 +257,9 @@ export interface DynamicConfig {
   bookline_max_exposure_usdc?: string;
   bookline_max_open_markets?: number;
   bookline_resting_tp_edge?: string;
+  // Board lane: instance-wide, rendered on the Sports Raptor card.
+  bookline_board_lane_enabled?: boolean;
+  bookline_board_max_open_markets?: number;
   sports_ledger_leagues:            string;
   sports_ledger_snapshot_offsets_mins: string;
   sports_ledger_credit_reserve:     number;

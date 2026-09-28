@@ -1869,10 +1869,15 @@ mod tests {
             // The sports line ledger's fields are absent too: they decide whether
             // research data is collected and carry the operator's own Odds API
             // account settings, neither of which is risk appetite.
+            //
+            // Bookline's board lane is a measurement lane off that ledger (it
+            // never reaches a venue), so its switch and sanity bound are
+            // excluded for the same reason.
             const NOT_IN_PROFILES: &[&str] = &[
                 "ghost_mode", "collateral_sweep_enabled",
                 "sports_ledger_enabled", "sports_ledger_leagues", "sports_ledger_snapshot_offsets_mins",
                 "sports_ledger_credit_reserve", "sports_ledger_quota_reset_day",
+                "bookline_board_lane_enabled", "bookline_board_max_open_markets",
             ];
             let missing: Vec<_> = schema_keys
                 .difference(&keys)

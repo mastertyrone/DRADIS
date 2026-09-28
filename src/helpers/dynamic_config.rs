@@ -266,6 +266,8 @@ fn default_bookline_trade_size_usdc() -> Decimal { config::BOOKLINE_TRADE_SIZE_U
 fn default_bookline_max_exposure_usdc() -> Decimal { config::BOOKLINE_MAX_EXPOSURE_USDC }
 fn default_bookline_max_open_markets() -> usize { config::BOOKLINE_MAX_OPEN_MARKETS }
 fn default_bookline_resting_tp_edge() -> Decimal { config::BOOKLINE_RESTING_TP_EDGE }
+fn default_bookline_board_lane_enabled() -> bool { config::BOOKLINE_BOARD_LANE_ENABLED }
+fn default_bookline_board_max_open_markets() -> usize { config::BOOKLINE_BOARD_MAX_OPEN_MARKETS }
 fn default_sports_fairvalue_max_dispersion()-> Decimal { config::SPORTS_FAIRVALUE_MAX_DISPERSION       }
 fn default_sports_fairvalue_settle_hold()   -> bool    { config::SPORTS_FAIRVALUE_SETTLE_HOLD          }
 fn default_sports_fairvalue_catastrophic() -> bool    { config::SPORTS_FAIRVALUE_CATASTROPHIC_ARMED   }
@@ -1168,6 +1170,15 @@ pub struct DynamicConfig {
     pub bookline_max_open_markets: usize,
     #[serde(default = "default_bookline_resting_tp_edge")]
     pub bookline_resting_tp_edge: Decimal,
+    /// Bookline's board lane: the same rule run off the sports ledger's own
+    /// snapshots against every pre-game market on the board, not only the one the
+    /// sports squadron holds. Global, because it runs in one task per instance off
+    /// the ledger and reads Bookline's parameters from the global row.
+    #[serde(default = "default_bookline_board_lane_enabled")]
+    pub bookline_board_lane_enabled: bool,
+    /// Sanity bound on the board lane's simultaneous simulated markets.
+    #[serde(default = "default_bookline_board_max_open_markets")]
+    pub bookline_board_max_open_markets: usize,
     /// Widest book disagreement a sports FairValue entry will accept.
     #[serde(default = "default_sports_fairvalue_max_dispersion")]
     pub sports_fairvalue_max_dispersion:  Decimal,
@@ -1453,6 +1464,8 @@ impl Default for DynamicConfig {
             bookline_max_exposure_usdc: config::BOOKLINE_MAX_EXPOSURE_USDC,
             bookline_max_open_markets: config::BOOKLINE_MAX_OPEN_MARKETS,
             bookline_resting_tp_edge: config::BOOKLINE_RESTING_TP_EDGE,
+            bookline_board_lane_enabled: config::BOOKLINE_BOARD_LANE_ENABLED,
+            bookline_board_max_open_markets: config::BOOKLINE_BOARD_MAX_OPEN_MARKETS,
             sports_fairvalue_max_dispersion:  config::SPORTS_FAIRVALUE_MAX_DISPERSION,
             sports_fairvalue_settle_hold:     config::SPORTS_FAIRVALUE_SETTLE_HOLD,
             sports_fairvalue_catastrophic_armed: config::SPORTS_FAIRVALUE_CATASTROPHIC_ARMED,
@@ -2134,6 +2147,8 @@ mod tests {
             "bookline_max_exposure_usdc",
             "bookline_max_open_markets",
             "bookline_resting_tp_edge",
+            "bookline_board_lane_enabled",
+            "bookline_board_max_open_markets",
         ] {
             assert!(obj.remove(added).is_some(), "{added} must be a serialized field");
         }
@@ -2150,6 +2165,8 @@ mod tests {
         assert_eq!(cfg.bookline_enabled, config::BOOKLINE_ENABLED);
         assert_eq!(cfg.bookline_min_consensus, config::BOOKLINE_MIN_CONSENSUS);
         assert_eq!(cfg.bookline_max_open_markets, config::BOOKLINE_MAX_OPEN_MARKETS);
+        assert_eq!(cfg.bookline_board_lane_enabled, config::BOOKLINE_BOARD_LANE_ENABLED);
+        assert_eq!(cfg.bookline_board_max_open_markets, config::BOOKLINE_BOARD_MAX_OPEN_MARKETS);
         assert_eq!(cfg.gboost_planb_shadow_min_win_rate, config::GBOOST_PLANB_SHADOW_MIN_WIN_RATE);
         assert_eq!(cfg.momentum_decay_exit_fraction, config::MOMENTUM_DECAY_EXIT_FRACTION);
         assert_eq!(cfg.momentum_decay_fee_margin_mult, config::MOMENTUM_DECAY_FEE_MARGIN_MULT);

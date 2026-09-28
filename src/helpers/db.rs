@@ -710,6 +710,10 @@ pub(crate) async fn init_schema(pool: &SqlitePool) -> Result<()> {
     ).execute(pool).await?;
     let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_sports_line_ledger_market ON sports_line_ledger(condition_id, ts)")
         .execute(pool).await;
+    // Bookline's board lane reads one token's asks since a quote time on every
+    // tick; the market index above cannot serve that.
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_sports_line_ledger_token ON sports_line_ledger(token_id, ts)")
+        .execute(pool).await;
 
     // [E63] A snapshot pass is not instantaneous: one paid odds call is followed
     // by a CLOB book read per outcome, so a single `ts` timestamped the book
@@ -982,10 +986,19 @@ async fn seed_market_taxonomy(pool: &SqlitePool) -> Result<()> {
 //   pulled   closed_at IS NOT NULL AND filled_at IS NULL   (ret IS NULL: no trade)
 //   closed   closed_at IS NOT NULL AND filled_at IS NOT NULL AND ret IS NOT NULL
 
+/// The Bookline lane that runs inside the sports squadron's patrol, against the
+/// one market the squadron holds, with the venue book at tick cadence.
+pub const BOOKLINE_LANE_SQUADRON: &str = "squadron";
+/// The Bookline lane that runs off the sports ledger's snapshots, against every
+/// pre-game market the board prices. Its fills resolve at snapshot cadence, so its
+/// record is a floor and not like-for-like with the squadron lane's.
+pub const BOOKLINE_LANE_BOARD: &str = "board";
+
 /// One simulated Bookline quote, resting or filled.
 #[derive(Debug, Clone)]
 pub struct BooklineShadow {
     pub id: i64,
+    pub lane: String,
     pub condition_id: String,
     pub token_id: String,
     pub market: String,
@@ -1000,21 +1013,24 @@ pub struct BooklineShadow {
     /// here rather than in memory, so a restart does not silently disarm the pull
     /// rule for the rest of a resting quote's life.
     pub consensus_at_quote: f64,
+    /// When the bid was placed. The board lane tests fills against ledger snapshots
+    /// taken after this, so it is part of the row's meaning and not only a log.
+    pub quoted_at: String,
     pub filled_at: Option<String>,
 }
 
 #[allow(clippy::too_many_arguments)]
 pub async fn bookline_shadow_quote(
-    pool: &SqlitePool, asset: &str, condition_id: &str, token_id: &str, market: &str, side: &str,
+    pool: &SqlitePool, lane: &str, asset: &str, condition_id: &str, token_id: &str, market: &str, side: &str,
     league: Option<&str>, commence: Option<&str>, quote_price: f64, shares: f64,
     consensus: f64, required_edge: f64, num_books: i64, dispersion: Option<f64>,
 ) -> bool {
     match sqlx::query(
         "INSERT INTO bookline_shadow
-            (asset, condition_id, token_id, market, side, league, commence, quoted_at,
+            (lane, asset, condition_id, token_id, market, side, league, commence, quoted_at,
              quote_price, shares, consensus_at_quote, required_edge, num_books, dispersion)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-        .bind(asset).bind(condition_id).bind(token_id).bind(market).bind(side)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+        .bind(lane).bind(asset).bind(condition_id).bind(token_id).bind(market).bind(side)
         .bind(league).bind(commence).bind(Utc::now().to_rfc3339())
         .bind(quote_price).bind(shares).bind(consensus).bind(required_edge)
         .bind(num_books).bind(dispersion)
@@ -1025,42 +1041,51 @@ pub async fn bookline_shadow_quote(
     }
 }
 
-/// Every simulated quote still live: resting or filled, not yet closed.
-pub async fn bookline_shadow_open(pool: &SqlitePool, asset: &str) -> Vec<BooklineShadow> {
-    let rows: Vec<(i64, String, String, String, String, Option<String>, f64, f64, f64, Option<String>)> =
+/// Every simulated quote of one lane still live: resting or filled, not yet closed.
+pub async fn bookline_shadow_open(pool: &SqlitePool, lane: &str, asset: &str) -> Vec<BooklineShadow> {
+    let rows: Vec<(i64, String, String, String, String, String, Option<String>, f64, f64, f64, String, Option<String>)> =
         sqlx::query_as(
-            "SELECT id, condition_id, token_id, market, side, commence, quote_price, shares,
-                    consensus_at_quote, filled_at
+            "SELECT id, lane, condition_id, token_id, market, side, commence, quote_price, shares,
+                    consensus_at_quote, quoted_at, filled_at
                FROM bookline_shadow
-              WHERE asset = ? AND closed_at IS NULL
+              WHERE lane = ? AND asset = ? AND closed_at IS NULL
               ORDER BY id")
-            .bind(asset)
+            .bind(lane).bind(asset)
             .fetch_all(pool).await
             .unwrap_or_else(|e| { error!("❌ DB bookline shadow read failed: {}", e); Vec::new() });
     rows.into_iter().map(|r| BooklineShadow {
-        id: r.0, condition_id: r.1, token_id: r.2, market: r.3, side: r.4, commence: r.5,
-        quote_price: r.6, shares: r.7, consensus_at_quote: r.8, filled_at: r.9,
+        id: r.0, lane: r.1, condition_id: r.2, token_id: r.3, market: r.4, side: r.5, commence: r.6,
+        quote_price: r.7, shares: r.8, consensus_at_quote: r.9, quoted_at: r.10, filled_at: r.11,
     }).collect()
 }
 
-/// Whether anything of Bookline's is already live on this market, either side.
+/// Whether anything of this lane's is already live on this market, either side.
 ///
 /// Not scoped to a token: a resting bid on one outcome and another on the
 /// opposite outcome is two-sided market making, which this viper exists not to do.
-pub async fn bookline_shadow_holds(pool: &SqlitePool, asset: &str, condition_id: &str) -> bool {
+/// Scoped to a LANE: the board lane quoting the market the squadron holds is not
+/// the squadron lane committing, and must not read as it.
+pub async fn bookline_shadow_holds(pool: &SqlitePool, lane: &str, asset: &str, condition_id: &str) -> bool {
     let n: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM bookline_shadow
-          WHERE asset = ? AND condition_id = ? AND closed_at IS NULL")
-        .bind(asset).bind(condition_id)
+          WHERE lane = ? AND asset = ? AND condition_id = ? AND closed_at IS NULL")
+        .bind(lane).bind(asset).bind(condition_id)
         .fetch_one(pool).await.unwrap_or(0);
     n > 0
 }
 
-/// Mark a resting quote filled.
+/// Mark a resting quote filled, now.
 pub async fn bookline_shadow_fill(pool: &SqlitePool, id: i64) -> bool {
+    bookline_shadow_fill_at(pool, id, &Utc::now().to_rfc3339()).await
+}
+
+/// Mark a resting quote filled at `at` (RFC 3339). The board lane learns of a
+/// fill from a ledger snapshot that may be minutes old by the time it looks, and
+/// the record should carry when the book crossed, not when the lane noticed.
+pub async fn bookline_shadow_fill_at(pool: &SqlitePool, id: i64, at: &str) -> bool {
     match sqlx::query(
         "UPDATE bookline_shadow SET filled_at = ? WHERE id = ? AND filled_at IS NULL AND closed_at IS NULL")
-        .bind(Utc::now().to_rfc3339()).bind(id)
+        .bind(at).bind(id)
         .execute(pool).await
     {
         Ok(r) => r.rows_affected() > 0,
@@ -1103,14 +1128,76 @@ pub async fn bookline_shadow_close(
 /// The condition id travels so the caller can bootstrap by GAME rather than by
 /// row — two outcomes of one match are one game's worth of evidence — the same
 /// reason the GBoost record carries its hourly window.
-pub async fn bookline_shadow_returns(pool: &SqlitePool, asset: &str) -> Vec<(String, f64)> {
+pub async fn bookline_shadow_returns(pool: &SqlitePool, lane: &str, asset: &str) -> Vec<(String, f64)> {
     sqlx::query_as(
         "SELECT condition_id, ret FROM bookline_shadow
-          WHERE asset = ? AND closed_at IS NOT NULL AND ret IS NOT NULL
+          WHERE lane = ? AND asset = ? AND closed_at IS NOT NULL AND ret IS NOT NULL
           ORDER BY id")
-        .bind(asset)
+        .bind(lane).bind(asset)
         .fetch_all(pool).await
         .unwrap_or_else(|e| { error!("❌ DB bookline shadow returns read failed: {}", e); Vec::new() })
+}
+
+/// One lane's record, counted rather than listed: what the operator asks first.
+///
+/// Reported PER LANE and never summed across them. The squadron lane sees the
+/// venue book at tick cadence and can fill within seconds of the ask crossing;
+/// the board lane sees a snapshot every few minutes and can only fill when a
+/// snapshot happens to catch the ask at or under the bid. The second is a floor
+/// under the first, not a second sample of the same thing, and a combined mean
+/// return would be a number with no referent.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct BooklineLaneSummary {
+    pub lane: String,
+    pub quoted: i64,
+    pub resting: i64,
+    pub filled_open: i64,
+    pub pulled: i64,
+    pub settled: i64,
+    pub wins: i64,
+    pub mean_ret: Option<f64>,
+    pub sum_ret: f64,
+}
+
+pub async fn bookline_shadow_lane_summary(pool: &SqlitePool, lane: &str) -> BooklineLaneSummary {
+    let row: Option<(i64, i64, i64, i64, i64, i64, Option<f64>, Option<f64>)> = sqlx::query_as(
+        "SELECT COUNT(*),
+                SUM(CASE WHEN closed_at IS NULL AND filled_at IS NULL THEN 1 ELSE 0 END),
+                SUM(CASE WHEN closed_at IS NULL AND filled_at IS NOT NULL THEN 1 ELSE 0 END),
+                SUM(CASE WHEN closed_at IS NOT NULL AND filled_at IS NULL THEN 1 ELSE 0 END),
+                SUM(CASE WHEN closed_at IS NOT NULL AND ret IS NOT NULL THEN 1 ELSE 0 END),
+                SUM(CASE WHEN closed_at IS NOT NULL AND ret > 0 THEN 1 ELSE 0 END),
+                AVG(CASE WHEN closed_at IS NOT NULL THEN ret END),
+                SUM(CASE WHEN closed_at IS NOT NULL THEN ret END)
+           FROM bookline_shadow WHERE lane = ?")
+        .bind(lane)
+        .fetch_optional(pool).await
+        .unwrap_or_else(|e| { error!("❌ DB bookline lane summary failed: {}", e); None });
+    let Some(r) = row else { return BooklineLaneSummary { lane: lane.to_string(), ..Default::default() } };
+    BooklineLaneSummary {
+        lane: lane.to_string(), quoted: r.0, resting: r.1, filled_open: r.2, pulled: r.3,
+        settled: r.4, wins: r.5, mean_ret: r.6, sum_ret: r.7.unwrap_or(0.0),
+    }
+}
+
+/// Every ledger snapshot of `token_id` taken after `since_ts`, oldest first.
+///
+/// What Bookline's board lane replays a resting quote against: each row is the
+/// line and the venue book as they stood at one snapshot, so the lane can ask, in
+/// order, "would the bid have been pulled here, or would the ask have crossed it?"
+/// Between snapshots the lane is blind, which is the reason its record is a floor.
+pub async fn sports_ledger_rows_for_token_since(pool: &SqlitePool, token_id: &str, since_ts: &str) -> Vec<SportsLedgerRow> {
+    sqlx::query_as::<_, SportsLedgerRow>(
+        "SELECT ts, league, sport_key, odds_event_id, pm_slug, condition_id, token_id, outcome_label,
+                odds_outcome, commence, secs_to_start, consensus, num_books, dispersion, max_book_age_secs,
+                pm_bid, pm_ask, pm_bid_size, pm_ask_size, credits_remaining,
+                odds_at, pm_at, overround, raw_consensus
+           FROM sports_line_ledger
+          WHERE token_id = ? AND ts > ?
+          ORDER BY ts ASC")
+        .bind(token_id).bind(since_ts)
+        .fetch_all(pool).await
+        .unwrap_or_else(|e| { error!("❌ DB sports ledger replay read failed: {}", e); Vec::new() })
 }
 
 /// The venue's own resolution for a token, as the sports ledger recorded it.
@@ -1333,6 +1420,23 @@ pub(crate) async fn run_migrations(pool: &SqlitePool) {
     let _ = sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_bookline_shadow_live
              ON bookline_shadow(asset, closed_at)"
+    ).execute(pool).await;
+    // Which Bookline lane wrote the row. The squadron lane runs inside the sports
+    // squadron's patrol against the one market it holds; the board lane runs off
+    // the sports ledger's snapshots against every pre-game market on the board.
+    // Both share this table because they are the same rule applied to different
+    // coverage, and a reader wanting the whole record should find it in one place.
+    // They must never read each other's rows: `bookline_shadow_holds` is what stops
+    // the viper quoting both sides of a game, and without this column a board-lane
+    // row on the squadron's market would have reported the squadron lane as
+    // "already committed". Rows written before the column existed are all the
+    // squadron's, which is what the default says. ALTER after CREATE, as always.
+    let _ = sqlx::query(
+        "ALTER TABLE bookline_shadow ADD COLUMN lane TEXT NOT NULL DEFAULT 'squadron'"
+    ).execute(pool).await;
+    let _ = sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_bookline_shadow_lane
+             ON bookline_shadow(lane, asset, closed_at)"
     ).execute(pool).await;
 
     // Add session_id to trades

@@ -649,7 +649,7 @@ use tracing::info;
 /// Zero on Polymarket International and negative on Polymarket US, where the maker
 /// rebate is paid at trade — but positive on Kalshi, which charges makers on every
 /// game series it ships. The quadratic is the same shape as the taker schedule.
-fn maker_fee(price: Decimal) -> Decimal {
+pub(crate) fn maker_fee(price: Decimal) -> Decimal {
     if price <= Decimal::ZERO || price >= Decimal::ONE { return Decimal::ZERO; }
     // NOT `taker_leg_fee_pct_at`: that helper floors a non-positive rate at zero,
     // which is right for a taker (no venue pays one to cross) and wrong here —
@@ -780,7 +780,9 @@ impl Strategy for BooklineStrategy {
         // A resting bid on one outcome and another on the opposite outcome is
         // two-sided market making, which this viper exists not to do — and nothing
         // in the keying prevents it, because a key is per token.
-        if crate::helpers::db::bookline_shadow_holds(&pool, &ctx.crypto_filter, &ctx.market.condition_id).await {
+        if crate::helpers::db::bookline_shadow_holds(
+            &pool, crate::helpers::db::BOOKLINE_LANE_SQUADRON, &ctx.crypto_filter, &ctx.market.condition_id,
+        ).await {
             idle("already committed on this market");
             return Ok(StrategySignal::NoSignal);
         }
@@ -789,7 +791,9 @@ impl Strategy for BooklineStrategy {
         // filled rows would let Bookline rest a bid on every deployed sports market
         // at once and discover its own ceiling after the first one crossed.
         let size = dc.bookline_trade_size_usdc;
-        let live = crate::helpers::db::bookline_shadow_open(&pool, &ctx.crypto_filter).await;
+        let live = crate::helpers::db::bookline_shadow_open(
+            &pool, crate::helpers::db::BOOKLINE_LANE_SQUADRON, &ctx.crypto_filter,
+        ).await;
         let open_markets = live.iter().map(|r| r.condition_id.clone())
             .collect::<std::collections::HashSet<_>>().len();
         let exposure: Decimal = live.iter()
@@ -882,7 +886,7 @@ impl Strategy for BooklineStrategy {
         );
 
         crate::helpers::db::bookline_shadow_quote(
-            &pool, &ctx.crypto_filter, &ctx.market.condition_id, token.as_str(),
+            &pool, crate::helpers::db::BOOKLINE_LANE_SQUADRON, &ctx.crypto_filter, &ctx.market.condition_id, token.as_str(),
             &ctx.market.market_name, if side == 0 { "YES" } else { "NO" },
             Some(line.league.as_str()), Some(&line.commence.to_rfc3339()),
             price.to_f64().unwrap_or(0.0), shares.to_f64().unwrap_or(0.0),
@@ -909,7 +913,11 @@ impl Strategy for BooklineStrategy {
         let Some(pool) = crate::helpers::db::pool_for(&ctx.crypto_filter) else {
             return Ok(StrategySignal::NoSignal);
         };
-        let live = crate::helpers::db::bookline_shadow_open(&pool, &ctx.crypto_filter).await;
+        // This lane's rows only. The board lane may hold a simulated position on
+        // this very market; it is looked after by its own sweep, off the ledger.
+        let live = crate::helpers::db::bookline_shadow_open(
+            &pool, crate::helpers::db::BOOKLINE_LANE_SQUADRON, &ctx.crypto_filter,
+        ).await;
         if live.is_empty() {
             return Ok(StrategySignal::NoSignal);
         }

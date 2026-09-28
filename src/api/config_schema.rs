@@ -1131,6 +1131,14 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
         v.push(F::new(sports, None, "sports_ledger_quota_reset_day", "Quota Reset Day", "int", true,
             "Day of the month (UTC) your Odds API quota resets, shown on your account page. Days after the 28th are treated as the 28th.")
             .range(1.0, 28.0).step(1.0));
+        // Bookline's board lane lives on the Sports Raptor card, not the Bookline
+        // card: it runs in one task per instance off the ledger's snapshots and
+        // reads the GLOBAL config row, so a squadron-scoped knob would have no
+        // squadron to belong to.
+        v.push(F::new(sports, None, "bookline_board_lane_enabled", "Bookline Board Lane", "bool", true,
+            "Run Bookline's quoting rule, simulated, against EVERY pre-game market on the bookmaker board using the ledger's own snapshots, not only the one market the sports squadron holds. Writes to the same simulated ledger under a separate lane and never places a venue order. Fills resolve at snapshot cadence (minutes apart), so its record is a conservative floor and is not like-for-like with the squadron lane. Needs the Sports Raptor on."));
+        v.push(F::new(sports, None, "bookline_board_max_open_markets", "Board Lane Max Open Markets", "int", true,
+            "Most markets the board lane may hold simulated positions on at once. A sanity bound, not a risk control: nothing here is capital, and the Bookline card's own Max Open Markets would defeat the point of measuring the whole board.").min(1.0).step(1.0));
         v.push(F::new(tennis, e, "tennis_tour", "Tennis Tour", "string", true,
             "Live Tennis API tour filter: atp, wta, challenger, itf, juniors — or blank for all tours. ⚠️ Not validated, and this one fails SILENTLY: a misspelt tour returns an empty match list, which is indistinguishable from tennis being off-season or between sessions. Leave blank if unsure."));
     }

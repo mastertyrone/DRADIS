@@ -553,6 +553,16 @@ async fn run() -> Result<()> {
                 Arc::clone(&http), dradis::venues::sports_catalog(), cfg.clone(), Arc::clone(&health))
         });
     }
+    // Bookline's board lane: the viper's quoting rule replayed off the ledger's
+    // snapshots against every pre-game market on the board, simulated, written to
+    // the same ledger as the squadron lane under its own lane label. Venue-neutral
+    // for the same reason the ledger is, and inert without it.
+    {
+        let cfg = config_rx.clone();
+        spawn_supervised("bookline-board", move || {
+            dradis::vipers::bookline_board::run_bookline_board(cfg.clone())
+        });
+    }
     let (tennis_tx, tennis_rx) =
         watch::channel(dradis::raptors::tennis::TennisSnapshot::default());
     {
