@@ -1121,8 +1121,15 @@ pub const GBOOST_PLANB_GATE_MIN_WIN_RATE: Decimal = dec!(0.53);
 /// live trial. Seeds the `gboost_planb_shadow_min_trades` Control Tower setting.
 pub const GBOOST_PLANB_SHADOW_MIN_TRADES: i64 = 40;
 /// Win rate the shadow record must reach before real money is released, alongside
-/// a mean return and a 90% bootstrap lower bound both above zero.
+/// a mean return above zero.
 pub const GBOOST_PLANB_SHADOW_MIN_WIN_RATE: Decimal = dec!(0.53);
+/// USDC per entry while a promoted model is on probation: its shadow record
+/// shows a positive mean over the minimum size but its 90% bootstrap lower bound
+/// is not yet above zero. The full `GBOOST_PLANB_TRADE_SIZE_USDC` applies once
+/// the lower bound clears. The venue's 5-share minimum still applies, so on a
+/// $0.80 ask this buys about $4 of shares whatever the figure. Seeds the
+/// `gboost_planb_probation_trade_size_usdc` Control Tower setting.
+pub const GBOOST_PLANB_PROBATION_TRADE_SIZE_USDC: Decimal = dec!(1.0);
 /// perpetual's training budget; 2.0 was selected by the pre-registered sweep.
 pub const GBOOST_PLANB_BUDGET: Decimal = dec!(2.0);
 

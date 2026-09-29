@@ -1346,9 +1346,13 @@ pub async fn gboost_shadow_close(pool: &SqlitePool, id: i64, exit_price: f64, re
 /// MARKET bootstrap: two entries on the same hourly market are one market's
 /// worth of evidence, not two, and resampling rows instead of markets would
 /// understate the interval exactly where the record is thinnest.
-pub async fn gboost_shadow_returns(pool: &SqlitePool, asset: &str, model_version: &str) -> Vec<(i64, f64)> {
+///
+/// Each row is `(window_start, ret, entry_price, p)`. The ask and the calibrated
+/// probability ride along so the viper can re-score the row against the entry
+/// rule in force when it reads the record (`rows_under_rule`).
+pub async fn gboost_shadow_returns(pool: &SqlitePool, asset: &str, model_version: &str) -> Vec<(i64, f64, f64, f64)> {
     sqlx::query_as(
-        "SELECT window_start, ret FROM gboost_shadow_trades
+        "SELECT window_start, ret, entry_price, p FROM gboost_shadow_trades
           WHERE asset = ? AND model_version = ? AND closed_at IS NOT NULL AND ret IS NOT NULL
           ORDER BY id")
         .bind(asset).bind(model_version)

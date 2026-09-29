@@ -162,6 +162,7 @@ export interface DynamicConfig {
   // GBoost Viper
   gboost_max_exposure_usdc: string;
   gboost_planb_trade_size_usdc: string;
+  gboost_planb_probation_trade_size_usdc: string;
   gboost_planb_margin: string;
   gboost_planb_take_profit_pct: string;
   gboost_planb_stop_loss_pct: string;

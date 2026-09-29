@@ -901,7 +901,7 @@ pub struct FoldStats {
 pub fn rule_stats(rows: &[&TrainingRow], p: &[f64], plan: &Plan) -> RuleStats {
     let mut order: Vec<usize> = (0..rows.len()).filter(|&i| {
         let r = rows[i];
-        p[i] >= break_even(r.ask, plan.tp, plan.sl, plan.fee) + plan.margin
+        p[i] >= break_even(r.ask, plan.tp, plan.sl, plan.fee, plan.tp_ceiling) + plan.margin
     }).collect();
     order.sort_by_key(|&i| (rows[i].w + 60 * rows[i].k, rows[i].w, rows[i].side));
     let mut seen: HashSet<(i64, usize)> = HashSet::new();
@@ -1088,10 +1088,13 @@ pub fn beats_incumbent(candidate: &FoldStats, incumbent: &FoldStats, min_trades:
 /// Zero when nothing is in service, when the file will not load, or when the
 /// shard has no database — all of which mean "no experiment is in progress",
 /// which is what `serve_decision` does with the number.
-async fn shadow_trades_recorded(asset: &str, serving_path: &std::path::Path) -> usize {
+async fn shadow_trades_recorded(asset: &str, serving_path: &std::path::Path, plan: &Plan) -> usize {
     let Ok(model) = crate::vipers::gboost_planb::load_model(serving_path) else { return 0 };
     let Some(pool) = crate::helpers::db::pool_for(asset) else { return 0 };
-    crate::helpers::db::gboost_shadow_returns(&pool, asset, &model.version).await.len()
+    let rows = crate::helpers::db::gboost_shadow_returns(&pool, asset, &model.version).await;
+    // The viper's own count: rows the configured rule would take, not every row
+    // ever opened, so the two cannot disagree about whether an experiment is on.
+    crate::vipers::gboost_planb::rows_under_rule(&rows, plan).len()
 }
 
 /// Whether the viper would actually trade this model under `plan`.
@@ -2460,7 +2463,7 @@ pub async fn run_pipeline(asset: String) {
                 // Read here rather than in the blocking cycle: the record lives
                 // in SQLite and the cycle runs on a native thread with no
                 // runtime to await on.
-                incumbent_shadow_trades: shadow_trades_recorded(&asset, &serving_path).await,
+                incumbent_shadow_trades: shadow_trades_recorded(&asset, &serving_path, &plan).await,
                 shadow_min_trades: knobs.shadow_min_trades,
             };
             let (tx, rx) = tokio::sync::oneshot::channel();
@@ -2810,7 +2813,7 @@ mod tests {
         let mk = |w, k, side, ret| TrainingRow { w, k, side, ask: 0.5, features: [0.0; N_FEATURES], y: ret > 0.0, ret, exit: ExitKind::Tp, exit_t: 0, elig: true };
         let rows = vec![mk(0, 10, 0, 0.1), mk(0, 5, 0, 0.3), mk(0, 7, 1, -0.1), mk(3600, 20, 0, 0.2)];
         let refs: Vec<&TrainingRow> = rows.iter().collect();
-        let need = break_even(0.5, 0.2, 0.11, 0.07) + 0.10;
+        let need = break_even(0.5, 0.2, 0.11, 0.07, 0.90) + 0.10;
         let p = vec![need + 0.01, need + 0.01, need + 0.01, need - 0.01];
         let s = rule_stats(&refs, &p, &plan);
         assert_eq!(s.trades, 2);

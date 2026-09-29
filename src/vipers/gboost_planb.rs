@@ -324,12 +324,16 @@ pub fn shadow_stats(returns: &[(i64, f64)]) -> ShadowStats {
 /// for the model, the record speaks for the instance, and neither alone is
 /// evidence that this operator's box should be buying.
 ///
-/// The bar is the pre-registration's, not a new one: at least
-/// `min_trades` entries, mean return above zero, the 90% bootstrap lower bound
-/// above zero, and a win rate at or above `min_win`. Returning the reason
-/// rather than a bool is deliberate — the card and the log have to be able to
-/// say which number is missing, or an operator cannot tell a viper that is
-/// working from one that is stuck.
+/// The bar: at least `min_trades` entries, mean return above zero, and a win
+/// rate at or above `min_win`. Until 2026-09-29 it also required the 90%
+/// market-bootstrap lower bound above zero, which at 40 trades of the plan's
+/// roughly 16% per-trade spread needs about +3% a trade: a slight edge, the kind
+/// this viper exists to find, would have sat simulated for hundreds of trades.
+/// That test now decides the stake instead (`live_stake`): a record that has
+/// cleared only this bar trades real money at the probation size. Returning the
+/// reason rather than a bool is deliberate — the card and the log have to be
+/// able to say which number is missing, or an operator cannot tell a viper that
+/// is working from one that is stuck.
 pub fn shadow_blocks_live(
     gate_passed: bool,
     rec: &ShadowStats,
@@ -345,13 +349,42 @@ pub fn shadow_blocks_live(
     if !(rec.mean_ret > 0.0) {
         return Some(format!("shadow mean return {:+.2}% is not above zero", rec.mean_ret * 100.0));
     }
-    if !(rec.lower_bound > 0.0) {
-        return Some(format!("shadow 90% lower bound {:+.2}% is not above zero", rec.lower_bound * 100.0));
-    }
     if rec.win < min_win {
         return Some(format!("shadow win rate {:.3} is below the {min_win:.2} bar", rec.win));
     }
     None
+}
+
+/// The stake a promoted model trades at, and its name for the card and the log.
+///
+/// The pre-registration's stricter bar, the record's 90% market-bootstrap lower
+/// bound above zero, is the line between the probation stake and the full one.
+/// A record that shows a positive mean but whose interval still touches zero
+/// buys at `probation`, never more than `full`; one that has cleared the
+/// interval buys at `full`. The record freezes when the lane goes live (no
+/// simulated entries are opened alongside real ones), so a model promoted on
+/// probation stays there until the operator raises the probation size in the
+/// Control Tower.
+pub fn live_stake(rec: &ShadowStats, full: Decimal, probation: Decimal) -> (Decimal, &'static str) {
+    if rec.lower_bound > 0.0 { (full, "full") } else { (probation.min(full), "probation") }
+}
+
+/// The closed shadow rows the CONFIGURED entry rule would have taken, as
+/// `(window_start, ret)` for `shadow_stats`.
+///
+/// A row is `(window_start, ret, entry ask, calibrated p)`. The record is
+/// evidence about the rule that would trade, so it is re-scored against that
+/// rule on every read rather than against the rule that opened the row: when
+/// the rule changes (the 2026-09-29 `break_even` correction, or an operator
+/// moving the margin or the band) rows the current rule would refuse stop
+/// counting, and rows it would still take keep counting, because the model and
+/// the outcome are unchanged and only the selection differed. Nothing is
+/// deleted, and no row is added: a row the old rule refused was never opened.
+pub fn rows_under_rule(rows: &[(i64, f64, f64, f64)], plan: &crate::vipers::gboost_planb_train::Plan) -> Vec<(i64, f64)> {
+    rows.iter()
+        .filter(|(_, _, ask, p)| decide_side(*ask, *p, plan.fee, plan.tp, plan.sl, plan.tp_ceiling, plan.margin, plan.lo, plan.hi).qualifies)
+        .map(|(w, ret, _, _)| (*w, *ret))
+        .collect()
 }
 
 /// Everything one decision minute needs.
@@ -532,13 +565,38 @@ pub fn build_features(inp: &DecisionInputs) -> std::result::Result<[[f64; N_FEAT
     Ok(out)
 }
 
+/// The take-profit price the plan can actually reach from an entry at `ask`: the
+/// +`tp` target rounded up to the tick and capped at `ceiling`. This is the price
+/// the labeler builds rows with (`gboost_planb_train`, `a_tp`) and the price
+/// `take_profit_target` rests the live ask at.
+pub fn effective_target(ask: f64, tp: f64, ceiling: f64) -> f64 {
+    crate::vipers::gboost_planb_train::ceil_tick(ask * (1.0 + tp)).min(ceiling)
+}
+
 /// Break-even win rate of the plan bought at `ask`: entry fee, taker stop fee, the
-/// target and the stop, as the harness's `break_even`.
-pub fn break_even(ask: f64, tp: f64, sl: f64, fee_rate: f64) -> f64 {
+/// stop, and the target the plan can actually reach.
+///
+/// The gain leg is `effective_target`, not the nominal `tp`. Until 2026-09-29 it
+/// was the nominal figure, and above $0.75 the $0.90 ceiling caps the target, so
+/// a +20% plan pays +12.5% at $0.80 and +5.9% at $0.85 while the rule priced it
+/// at +20%: with the 0.05 margin it demanded 0.48 at $0.80 where the corrected
+/// rule demands 0.61, and it was most lenient exactly where the payoff is worst. Production's first 40 shadow
+/// trades were selected by that rule: take-profits of +13.8% (entries near $0.79
+/// hitting the ceiling), 50% won, -1.13% a trade. The labels and the holdout
+/// returns always used the capped target, so this changes which rows the rule
+/// takes and not what the model was trained to predict.
+///
+/// An entry with no reachable target returns 1.0: no win rate breaks even on a
+/// trade that can only stop or settle.
+pub fn break_even(ask: f64, tp: f64, sl: f64, fee_rate: f64, ceiling: f64) -> f64 {
+    let target = effective_target(ask, tp, ceiling);
+    if !(target > ask) {
+        return 1.0;
+    }
     let fe = fee_rate * ask * (1.0 - ask) / ask;
     let stop = ask * (1.0 - sl);
     let fx = fee_rate * stop * (1.0 - stop) / ask;
-    let gain = tp - fe;
+    let gain = (target - ask) / ask - fe;
     let loss = sl + fe + fx;
     loss / (gain + loss)
 }
@@ -559,14 +617,19 @@ pub struct SideDecision {
     pub reason: &'static str,
 }
 
-pub fn decide_side(ask: f64, p: f64, fee_rate: f64, tp: f64, sl: f64, margin: f64, min_ask: f64, max_ask: f64) -> SideDecision {
+pub fn decide_side(ask: f64, p: f64, fee_rate: f64, tp: f64, sl: f64, ceiling: f64, margin: f64, min_ask: f64, max_ask: f64) -> SideDecision {
     if !(ask > 0.0 && ask < 1.0) {
         return SideDecision { qualifies: false, break_even: f64::NAN, required: f64::NAN, reason: "no usable ask" };
     }
-    let be = break_even(ask, tp, sl, fee_rate);
+    let be = break_even(ask, tp, sl, fee_rate, ceiling);
     let required = be + margin;
     if ask < min_ask || ask > max_ask {
         return SideDecision { qualifies: false, break_even: be, required, reason: "ask outside the trained band" };
+    }
+    // Named rather than left to the arithmetic (a break-even of 1.0 fails every
+    // p) so the log says why a $0.90 ask never qualifies under a $0.90 ceiling.
+    if !(effective_target(ask, tp, ceiling) > ask) {
+        return SideDecision { qualifies: false, break_even: be, required, reason: "no take-profit above the entry under the ceiling" };
     }
     if p >= required {
         SideDecision { qualifies: true, break_even: be, required, reason: "clears break-even plus margin" }
@@ -1037,14 +1100,20 @@ pub fn model_path(asset: &str) -> PathBuf {
 /// spending my money, and if not, why not — so the line answers it with the
 /// numbers rather than a status word. A viper that is working towards a
 /// promotion and one that is stuck look identical without them.
-pub fn lane_line(gate_passed: bool, rec: &ShadowStats, min_trades: usize, min_win: f64) -> String {
+pub fn lane_line(gate_passed: bool, rec: &ShadowStats, min_trades: usize, min_win: f64, full: Decimal, probation: Decimal) -> String {
     let numbers = format!(
         "record {} trades, {:+.2}% per trade, 90% lower bound {:+.2}%, win {:.3}",
         rec.trades, rec.mean_ret * 100.0, rec.lower_bound * 100.0, rec.win,
     );
     match shadow_blocks_live(gate_passed, rec, min_trades, min_win) {
         Some(why) => format!("SHADOW — trading simulated, not real money: {why} ({numbers})"),
-        None => format!("LIVE — the gate passed and this instance's own record earned it ({numbers})"),
+        None => match live_stake(rec, full, probation) {
+            (stake, "probation") => format!(
+                "LIVE at the probation stake ${stake:.2} — the gate passed and this instance's own record earned it, \
+                 but its 90% lower bound is not yet above zero ({numbers})"
+            ),
+            (stake, _) => format!("LIVE at the full stake ${stake:.2} — the gate passed and this instance's own record earned it ({numbers})"),
+        },
     }
 }
 
@@ -1433,7 +1502,7 @@ const SHADOW_GIVE_UP_SECS: i64 = 24 * 3600;
 /// inherit the evidence an older one earned. That is the point of the scoping
 /// and not an incidental detail — without it the first retrain after promotion
 /// would hand its successor a real-money license it never tested.
-async fn shadow_record_for(asset: &str, version: &str) -> ShadowStats {
+async fn shadow_record_for(asset: &str, version: &str, plan: &crate::vipers::gboost_planb_train::Plan) -> ShadowStats {
     let g = globals(asset);
     {
         let cached = lock(&g.shadow_record);
@@ -1444,7 +1513,8 @@ async fn shadow_record_for(asset: &str, version: &str) -> ShadowStats {
         }
     }
     let Some(pool) = crate::helpers::db::pool_for(asset) else { return ShadowStats::default() };
-    let rec = shadow_stats(&crate::helpers::db::gboost_shadow_returns(&pool, asset, version).await);
+    let rows = crate::helpers::db::gboost_shadow_returns(&pool, asset, version).await;
+    let rec = shadow_stats(&rows_under_rule(&rows, plan));
     *lock(&g.shadow_record) = Some((version.to_string(), rec, Instant::now()));
     rec
 }
@@ -1633,8 +1703,12 @@ impl Strategy for GboostPlanBStrategy {
             if due {
                 let lane = match model.as_deref() {
                     Some(m) => {
-                        let rec = shadow_record_for(&ctx.crypto_filter, &m.version).await;
-                        Some(lane_line(m.gate_passed, &rec, dc.gboost_planb_shadow_min_trades.max(0) as usize, f(dc.gboost_planb_shadow_min_win_rate)))
+                        let plan_now = crate::vipers::gboost_planb_train::Plan::from_config(dc, plan_fee_rate());
+                        let rec = shadow_record_for(&ctx.crypto_filter, &m.version, &plan_now).await;
+                        Some(lane_line(
+                            m.gate_passed, &rec, dc.gboost_planb_shadow_min_trades.max(0) as usize, f(dc.gboost_planb_shadow_min_win_rate),
+                            dc.gboost_planb_trade_size_usdc, dc.gboost_planb_probation_trade_size_usdc,
+                        ))
                     }
                     None => None,
                 };
@@ -1745,7 +1819,8 @@ impl Strategy for GboostPlanBStrategy {
         let decisions: Vec<SideDecision> = (0..2)
             .map(|side| decide_side(
                 ask[side], preds[side].1, f(crate::venues::taker_fee_rate()), f(dc.gboost_planb_take_profit_pct),
-                f(dc.gboost_planb_stop_loss_pct), f(dc.gboost_planb_margin), f(dc.gboost_planb_min_ask), f(dc.gboost_planb_max_ask),
+                f(dc.gboost_planb_stop_loss_pct), f(dc.gboost_planb_tp_ceiling), f(dc.gboost_planb_margin),
+                f(dc.gboost_planb_min_ask), f(dc.gboost_planb_max_ask),
             ))
             .collect();
         let label = ["YES", "NO"];
@@ -1811,7 +1886,34 @@ impl Strategy for GboostPlanBStrategy {
             }
             dc.gboost_max_exposure_usdc - exposure
         };
-        let shares = match entry_shares(dc.gboost_planb_trade_size_usdc, room, ask_dec, crate::venues::taker_fee_rate()) {
+        // ── The shadow lane ──────────────────────────────────────────────────
+        //
+        // Real money needs two things, and this is the only place that decides
+        // it: the model cleared the holdout gate when it was trained, and this
+        // instance's own out-of-sample record cleared the promotion bar. The
+        // gate speaks for the model, the record speaks for the box, and neither
+        // alone is evidence that this operator should be buying.
+        //
+        // Until both hold, the entry is taken simulated and NO signal is emitted.
+        // It must be done this way rather than by flagging the order simulated:
+        // the intl patrol derives one `ghosting` value per tick from the global
+        // switch and consults a per-order flag at exactly one site, so an Entry
+        // marked simulated on a live instance would place a real order.
+        //
+        // Decided before sizing, because the lane sets the stake: a simulated
+        // entry is sized at the full Trade Size so the record describes the plan
+        // the operator configured, and a live one at the stake the record has
+        // earned (`live_stake`).
+        let plan_now = crate::vipers::gboost_planb_train::Plan::from_config(dc, plan_fee_rate());
+        let record = shadow_record_for(&ctx.crypto_filter, &model.version, &plan_now).await;
+        let min_trades = dc.gboost_planb_shadow_min_trades.max(0) as usize;
+        let min_win = f(dc.gboost_planb_shadow_min_win_rate);
+        let lane_block = shadow_blocks_live(model.gate_passed, &record, min_trades, min_win);
+        let (stake, tier) = match &lane_block {
+            Some(_) => (dc.gboost_planb_trade_size_usdc, "simulated"),
+            None => live_stake(&record, dc.gboost_planb_trade_size_usdc, dc.gboost_planb_probation_trade_size_usdc),
+        };
+        let shares = match entry_shares(stake, room, ask_dec, crate::venues::taker_fee_rate()) {
             Ok(s) => s,
             Err(why) => {
                 info!("GBoost plan-B [{}] {} qualifies but is not entered: {why} (room ${:.2})", market.market_name, label[side], room);
@@ -1823,24 +1925,7 @@ impl Strategy for GboostPlanBStrategy {
             idle("insufficient collateral");
             return Ok(StrategySignal::NoSignal);
         }
-
-        // ── The shadow lane ──────────────────────────────────────────────────
-        //
-        // Real money needs two things, and this is the only place that decides
-        // it: the model cleared the holdout gate when it was trained, and this
-        // instance's own out-of-sample record cleared the pre-registration's bar.
-        // The gate speaks for the model, the record speaks for the box, and
-        // neither alone is evidence that this operator should be buying.
-        //
-        // Until both hold, the entry is taken simulated and NO signal is emitted.
-        // It must be done this way rather than by flagging the order simulated:
-        // the intl patrol derives one `ghosting` value per tick from the global
-        // switch and consults a per-order flag at exactly one site, so an Entry
-        // marked simulated on a live instance would place a real order.
-        let record = shadow_record_for(&ctx.crypto_filter, &model.version).await;
-        let min_trades = dc.gboost_planb_shadow_min_trades.max(0) as usize;
-        let min_win = f(dc.gboost_planb_shadow_min_win_rate);
-        if let Some(why) = shadow_blocks_live(model.gate_passed, &record, min_trades, min_win) {
+        if let Some(why) = lane_block {
             let Some(pool) = crate::helpers::db::pool_for(&ctx.crypto_filter) else {
                 idle("the shadow lane has no database to record into");
                 return Ok(StrategySignal::NoSignal);
@@ -1885,7 +1970,7 @@ impl Strategy for GboostPlanBStrategy {
         // viper does and it must be legible in the log afterwards.
         if lock(&g.shadow_announced).insert(model.version.clone()) {
             info!(
-                "💰 GBoost is now trading REAL MONEY on model {}: it cleared the holdout gate, and this \
+                "💰 GBoost is now trading REAL MONEY on model {} at the {tier} stake ${stake:.2}: it cleared the holdout gate, and this \
                  instance's shadow record is {} trades at {:+.2}% per trade, 90% lower bound {:+.2}%, win {:.3}",
                 model.version, record.trades, record.mean_ret * 100.0, record.lower_bound * 100.0, record.win,
             );
@@ -1895,7 +1980,7 @@ impl Strategy for GboostPlanBStrategy {
         // pass), not here: an entry the patrol drops (a cooldown, a pending order) or the book
         // kills unfilled stays eligible at the next decision minute.
         info!(
-            "GBoost plan-B [{}] ENTRY {} at ${:.3} x {:.2} (p={:.4} break-even={:.4} need={:.4}, model {})",
+            "GBoost plan-B [{}] ENTRY {} at ${:.3} x {:.2} at the {tier} stake ${stake:.2} (p={:.4} break-even={:.4} need={:.4}, model {})",
             market.market_name, label[side], ask[side], shares, preds[side].1, decisions[side].break_even, decisions[side].required, model.version,
         );
         crate::helpers::metrics::stash_entry_signals_json_for(STRATEGY_NAME, token_id.as_str(), serde_json::json!({
@@ -2299,12 +2384,50 @@ mod tests {
     /// The harness's `break_even` at a $0.50 ask, 20% target, 11% stop, 7% fee rate.
     #[test]
     fn break_even_matches_the_harness_formula() {
-        let be = break_even(0.50, 0.20, 0.11, 0.07);
+        let be = break_even(0.50, 0.20, 0.11, 0.07, 0.90);
         assert!((be - 0.521151).abs() < 1e-5, "break-even {be}");
         // The fee is rate × p × (1 − p) per share, a larger share of a cheaper contract, so the bottom
-        // of the band needs the higher win rate: about 0.54 at $0.43 against about 0.45 at $0.75.
-        assert!((break_even(0.43, 0.20, 0.11, 0.07) - 0.5406).abs() < 1e-3);
-        assert!((break_even(0.75, 0.20, 0.11, 0.07) - 0.4481).abs() < 1e-3);
+        // of the band needs the higher win rate: about 0.53 at $0.43 against about 0.45 at $0.75.
+        // ($0.43 × 1.2 = $0.516 rests at the $0.52 tick, a 20.9% target, which is what the labeler
+        // pays; the harness's nominal 20% gave 0.5406.)
+        assert!((break_even(0.43, 0.20, 0.11, 0.07, 0.90) - 0.5265).abs() < 1e-3);
+        assert!((break_even(0.75, 0.20, 0.11, 0.07, 0.90) - 0.4481).abs() < 1e-3);
+    }
+
+    /// Above $0.75 the ceiling caps the target, and the rule must price what the
+    /// plan can actually earn there. Until 2026-09-29 it priced the nominal +20%,
+    /// a break-even of 0.43 at $0.80 against a true 0.56, and let the shadow lane
+    /// buy $0.79 favorites at a 50% win rate with +11% / -14% geometry.
+    #[test]
+    fn break_even_prices_the_ceiling_capped_target_above_the_knee() {
+        let be = |ask| break_even(ask, 0.20, 0.11, 0.07, 0.90);
+        // $0.80: target $0.90, +12.5% gross, +11.1% net of the entry fee.
+        assert!((be(0.80) - 0.5612).abs() < 1e-3, "{}", be(0.80));
+        // $0.85: target $0.90, +5.9% gross, +4.8% net; the loss leg is nearly three times the gain.
+        assert!((be(0.85) - 0.7374).abs() < 1e-3, "{}", be(0.85));
+        // $0.90: no target above the entry, so no win rate breaks even.
+        assert_eq!(be(0.90), 1.0);
+        // Monotone through the knee: the rule gets stricter, never looser, as the ask rises past $0.75.
+        assert!(be(0.75) < be(0.80) && be(0.80) < be(0.85) && be(0.85) < be(0.88) && be(0.88) < be(0.90));
+        // Below the knee the ceiling is inert: the same number with or without it.
+        assert_eq!(be(0.60), break_even(0.60, 0.20, 0.11, 0.07, 1.0));
+        assert_eq!(effective_target(0.80, 0.20, 0.90), 0.90);
+        assert!((effective_target(0.43, 0.20, 0.90) - 0.52).abs() < 1e-9);
+    }
+
+    /// The same rule, asked through `decide_side` with the production band, at
+    /// the asks the shadow lane actually bought.
+    #[test]
+    fn a_favorite_the_ceiling_leaves_little_on_needs_the_probability_to_show_it() {
+        let d = |ask: f64, p: f64| decide_side(ask, p, 0.07, 0.20, 0.11, 0.90, 0.05, 0.25, 0.90);
+        // The old rule's requirement at $0.79 was about 0.49; a calibrated 0.55 cleared it.
+        // The corrected rule needs about 0.585 there (break-even 0.535 plus the margin).
+        assert!(!d(0.79, 0.55).qualifies, "0.55 is below the corrected {:.3}", d(0.79, 0.55).required);
+        assert!(d(0.79, 0.62).qualifies);
+        assert!(d(0.79, 0.62).required > 0.58 && d(0.79, 0.62).required < 0.59, "{}", d(0.79, 0.62).required);
+        assert_eq!(d(0.90, 0.99).reason, "no take-profit above the entry under the ceiling");
+        assert!(!d(0.90, 0.99).qualifies);
+        assert_eq!(d(0.89, 0.9999).reason, "below break-even plus margin");
     }
 
     #[test]
@@ -2316,8 +2439,8 @@ mod tests {
 
     #[test]
     fn a_side_qualifies_only_inside_the_band_and_above_break_even_plus_margin() {
-        let d = |ask: f64, p: f64| decide_side(ask, p, 0.07, 0.20, 0.11, 0.10, 0.43, 0.75);
-        let need = break_even(0.50, 0.20, 0.11, 0.07) + 0.10;
+        let d = |ask: f64, p: f64| decide_side(ask, p, 0.07, 0.20, 0.11, 0.90, 0.10, 0.43, 0.75);
+        let need = break_even(0.50, 0.20, 0.11, 0.07, 0.90) + 0.10;
         assert!(d(0.50, need + 0.001).qualifies);
         assert!(!d(0.50, need - 0.001).qualifies);
         assert_eq!(d(0.42, 0.99).reason, "ask outside the trained band");
@@ -2509,7 +2632,8 @@ mod deriv_feature_tests {
 
 #[cfg(test)]
 mod shadow_promotion_tests {
-    use super::{lane_line, shadow_blocks_live, shadow_exit, shadow_levels, shadow_ret, shadow_stats, ShadowStats};
+    use super::{lane_line, live_stake, rows_under_rule, shadow_blocks_live, shadow_exit, shadow_levels, shadow_ret, shadow_stats, ShadowStats};
+    use rust_decimal_macros::dec;
 
     fn passing() -> ShadowStats {
         ShadowStats { trades: 44, mean_ret: 0.026, lower_bound: 0.004, win: 0.57 }
@@ -2532,7 +2656,6 @@ mod shadow_promotion_tests {
         let cases = [
             (ShadowStats { trades: 12, ..passing() }, "shadow record 12 of 40 trades"),
             (ShadowStats { mean_ret: -0.004, ..passing() }, "shadow mean return -0.40% is not above zero"),
-            (ShadowStats { lower_bound: -0.021, ..passing() }, "shadow 90% lower bound -2.10% is not above zero"),
             (ShadowStats { win: 0.48, ..passing() }, "shadow win rate 0.480 is below the 0.53 bar"),
         ];
         for (rec, expected) in cases {
@@ -2540,15 +2663,48 @@ mod shadow_promotion_tests {
         }
     }
 
-    /// The bar is the pre-registration's, so a record that only just clears it
-    /// clears it, and a zero lower bound does not: "above zero" is strict
-    /// because an interval touching zero is the result that failed.
+    /// A record that only just clears the bar clears it, and a zero mean does
+    /// not: "above zero" is strict. The lower bound no longer blocks promotion
+    /// (2026-09-29); it sets the stake instead.
     #[test]
-    fn the_bar_is_the_pre_registrations_and_zero_is_not_above_zero() {
-        let edge = ShadowStats { trades: 40, mean_ret: 0.0001, lower_bound: 0.0001, win: 0.53 };
-        assert!(shadow_blocks_live(true, &edge, 40, 0.53).is_none(), "exactly at the bar passes");
-        let zero_lb = ShadowStats { lower_bound: 0.0, ..edge };
-        assert!(shadow_blocks_live(true, &zero_lb, 40, 0.53).is_some(), "a zero lower bound is not above zero");
+    fn the_bar_is_a_positive_mean_and_zero_is_not_above_zero() {
+        let edge = ShadowStats { trades: 40, mean_ret: 0.0001, lower_bound: -0.02, win: 0.53 };
+        assert!(shadow_blocks_live(true, &edge, 40, 0.53).is_none(), "a positive mean with an interval touching zero promotes");
+        let zero_mean = ShadowStats { mean_ret: 0.0, ..edge };
+        assert!(shadow_blocks_live(true, &zero_mean, 40, 0.53).is_some(), "a zero mean is not above zero");
+    }
+
+    /// The lower bound decides the stake: probation until the interval clears
+    /// zero, the full size after, and never more than the full size.
+    #[test]
+    fn the_lower_bound_sets_the_stake() {
+        let touching = ShadowStats { trades: 40, mean_ret: 0.01, lower_bound: -0.02, win: 0.55 };
+        assert_eq!(live_stake(&touching, dec!(4.0), dec!(1.0)), (dec!(1.0), "probation"));
+        assert_eq!(live_stake(&ShadowStats { lower_bound: 0.0, ..touching }, dec!(4.0), dec!(1.0)), (dec!(1.0), "probation"));
+        assert_eq!(live_stake(&passing(), dec!(4.0), dec!(1.0)), (dec!(4.0), "full"));
+        assert_eq!(live_stake(&touching, dec!(4.0), dec!(9.0)), (dec!(4.0), "probation"), "probation never exceeds the full size");
+    }
+
+    /// The record is evidence about the rule that would trade, so rows are
+    /// re-scored against the configured rule on every read: a row the current
+    /// rule would refuse stops counting, a row it would still take keeps
+    /// counting, and nothing is deleted.
+    #[test]
+    fn the_record_counts_only_the_rows_the_configured_rule_would_take() {
+        use crate::vipers::gboost_planb_train::{EntryRule, Plan};
+        let plan = Plan { entry: EntryRule::FirstAfter, tp: 0.20, sl: 0.11, tp_ceiling: 0.90, lo: 0.25, hi: 0.90, fee: 0.07, margin: 0.05, first_minute: 5, last_minute: 45 };
+        let rows = vec![
+            (0, 0.14, 0.50, 0.60),      // $0.50 at p 0.60: below the knee, qualifies under both rules
+            (3600, -0.15, 0.79, 0.55),  // $0.79 at p 0.55: the old rule took it at need 0.49; the corrected rule needs 0.61
+            (7200, 0.13, 0.79, 0.65),   // $0.79 at p 0.65: qualifies under both
+            (10800, -0.16, 0.90, 0.70), // $0.90: no target under the ceiling, refused
+        ];
+        let kept = rows_under_rule(&rows, &plan);
+        assert_eq!(kept, vec![(0, 0.14), (7200, 0.13)]);
+        // A wider margin re-scores the same rows without touching them.
+        let strict = Plan { margin: 0.20, ..plan };
+        assert_eq!(rows_under_rule(&rows, &strict), vec![]);
+        assert_eq!(rows_under_rule(&[], &plan), vec![]);
     }
 
     /// The plan's exit rule, which the shadow record is only evidence about if
@@ -2658,17 +2814,23 @@ mod shadow_promotion_tests {
     #[test]
     fn the_card_names_the_lane_and_what_is_missing() {
         let thin = ShadowStats { trades: 12, mean_ret: 0.008, lower_bound: -0.021, win: 0.58 };
-        let line = lane_line(true, &thin, 40, 0.53);
+        let line = lane_line(true, &thin, 40, 0.53, dec!(4.0), dec!(1.0));
         assert!(line.starts_with("SHADOW"), "{line}");
         assert!(line.contains("shadow record 12 of 40 trades"), "it must name the missing number: {line}");
 
         let earned = ShadowStats { trades: 44, mean_ret: 0.026, lower_bound: 0.004, win: 0.57 };
-        let line = lane_line(true, &earned, 40, 0.53);
-        assert!(line.starts_with("LIVE"), "{line}");
+        let line = lane_line(true, &earned, 40, 0.53, dec!(4.0), dec!(1.0));
+        assert!(line.starts_with("LIVE at the full stake $4.00"), "{line}");
         assert!(line.contains("+2.60%"), "{line}");
 
+        // Promoted on a positive mean alone: live, at the probation stake, and the card says why.
+        let probation = ShadowStats { trades: 44, mean_ret: 0.008, lower_bound: -0.012, win: 0.55 };
+        let line = lane_line(true, &probation, 40, 0.53, dec!(4.0), dec!(1.0));
+        assert!(line.starts_with("LIVE at the probation stake $1.00"), "{line}");
+        assert!(line.contains("lower bound is not yet above zero"), "{line}");
+
         // A model that never cleared the gate says so, however good the record.
-        let line = lane_line(false, &earned, 40, 0.53);
+        let line = lane_line(false, &earned, 40, 0.53, dec!(4.0), dec!(1.0));
         assert!(line.starts_with("SHADOW") && line.contains("holdout gate"), "{line}");
     }
 
@@ -2728,8 +2890,9 @@ mod shadow_promotion_tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0, 1_758_600_000, "the hourly window is carried for the market bootstrap");
         assert!((rows[0].1 - ret).abs() < 1e-12);
+        assert!((rows[0].2 - 0.60).abs() < 1e-12, "the ask rides along so the row can be re-scored");
 
-        let rec = shadow_stats(&rows);
+        let rec = shadow_stats(&rows.iter().map(|r| (r.0, r.1)).collect::<Vec<_>>());
         assert_eq!(rec.trades, 1);
         assert!(rec.mean_ret > 0.0);
         // One trade is nowhere near the bar, and the card must say which number.

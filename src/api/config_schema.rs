@@ -546,7 +546,10 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
              and skipped when it does not.").min(0.0).step(0.5).unit("USDC"));
         v.push(F::new(g, e, "gboost_planb_margin", "Entry Margin", "decimal", false,
             "How far the calibrated win probability must clear the plan's break-even win rate to enter \
-             (0.10 = 10 points). Break-even is about 0.45 at a $0.75 ask and 0.54 at $0.43.").range(0.0, 0.5).step(0.01));
+             (0.10 = 10 points). Break-even is priced on the take-profit the plan can actually reach: about 0.45 \
+             at a $0.75 ask and 0.53 at $0.43, and above $0.75 the Take-Profit Ceiling caps the target so it \
+             rises steeply (0.56 at $0.80, 0.74 at $0.85). An ask the ceiling leaves no profit on never \
+             qualifies.").range(0.0, 0.5).step(0.01));
         v.push(F::new(g, e, "gboost_planb_take_profit_pct", "Plan Take Profit", "pct", true,
             "Take-profit target, entry-relative. The model's labels were built with 20%, so a different \
              target changes what its probabilities mean, which is why this is operator-only.").range(0.0, 1.0).step(0.01));
@@ -554,13 +557,21 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
             "How many simulated trades this instance's shadow lane must record before GBoost is allowed to \
              spend real money. GBoost always runs: until it is promoted it trades simulated, and it is promoted \
              only when its model has cleared the training holdout gate AND this record shows a mean return above \
-             zero, a 90% bootstrap lower bound above zero, and the win rate below. The viper's card names \
+             zero and the win rate below. The record counts the simulated trades the CURRENT entry rule would \
+             have taken, so changing the margin, the band or the plan re-scores it. The viper's card names \
              whichever number is still missing. Lowering this promotes on thinner evidence."
         ).range(5.0, 500.0).step(1.0));
         v.push(F::new(g, e, "gboost_planb_shadow_min_win_rate", "Shadow Win Rate Bar", "pct", true,
             "Win rate the shadow record must reach before GBoost trades real money. Break-even at plan-B \
              prices is about 0.49, so the default asks for a real edge rather than a coin flip."
         ).range(0.0, 1.0).step(0.01));
+        v.push(F::new(g, e, "gboost_planb_probation_trade_size_usdc", "Probation Trade Size", "usd", false,
+            "USDC per entry while a promoted model is on probation: its shadow record has a positive mean over \
+             the Shadow Record Size but its 90% bootstrap lower bound is not yet above zero. Once the lower \
+             bound clears, entries use the full Trade Size. Never more than Trade Size. The venue's 5-share \
+             minimum still applies, so at a $0.80 ask this buys about $4 of shares whatever the figure. The \
+             record freezes when GBoost goes live, so a model promoted on probation stays at this size until \
+             you raise it here.").range(0.0, 50.0).step(0.5).unit("USDC"));
         v.push(F::new(g, e, "gboost_planb_held_exposure_usdc", "Held Exposure Cap", "usd", true,
             "Most this viper may have tied up in positions whose market has already closed and which are \
              waiting to settle. Only the hold postures create these; at Exit Posture 0 nothing is ever held \
