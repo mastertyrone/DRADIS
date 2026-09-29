@@ -260,6 +260,17 @@ export interface DynamicConfig {
   // Board lane: instance-wide, rendered on the Sports Raptor card.
   bookline_board_lane_enabled?: boolean;
   bookline_board_max_open_markets?: number;
+  bookline_board_base_edge?: string;
+  bookline_board_min_edge?: string;
+  bookline_board_edge_taper_secs?: number;
+  bookline_board_drift_mult?: string;
+  bookline_board_min_consensus?: string;
+  bookline_board_min_books?: number;
+  bookline_board_max_dispersion?: string;
+  bookline_board_max_feed_age_secs?: number;
+  bookline_board_pull_feed_age_secs?: number;
+  bookline_board_pull_on_adverse_drift?: string;
+  bookline_board_pull_before_start_secs?: number;
   sports_ledger_leagues:            string;
   sports_ledger_snapshot_offsets_mins: string;
   sports_ledger_credit_reserve:     number;

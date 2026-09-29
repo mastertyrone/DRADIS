@@ -268,6 +268,17 @@ fn default_bookline_max_open_markets() -> usize { config::BOOKLINE_MAX_OPEN_MARK
 fn default_bookline_resting_tp_edge() -> Decimal { config::BOOKLINE_RESTING_TP_EDGE }
 fn default_bookline_board_lane_enabled() -> bool { config::BOOKLINE_BOARD_LANE_ENABLED }
 fn default_bookline_board_max_open_markets() -> usize { config::BOOKLINE_BOARD_MAX_OPEN_MARKETS }
+fn default_bookline_board_base_edge() -> Decimal { config::BOOKLINE_BASE_EDGE }
+fn default_bookline_board_min_edge() -> Decimal { config::BOOKLINE_MIN_EDGE }
+fn default_bookline_board_edge_taper_secs() -> i64 { config::BOOKLINE_EDGE_TAPER_SECS }
+fn default_bookline_board_drift_mult() -> Decimal { config::BOOKLINE_DRIFT_MULT }
+fn default_bookline_board_min_consensus() -> Decimal { config::BOOKLINE_MIN_CONSENSUS }
+fn default_bookline_board_min_books() -> i64 { config::BOOKLINE_MIN_BOOKS }
+fn default_bookline_board_max_dispersion() -> Decimal { config::BOOKLINE_MAX_DISPERSION }
+fn default_bookline_board_max_feed_age_secs() -> i64 { config::BOOKLINE_MAX_FEED_AGE_SECS }
+fn default_bookline_board_pull_feed_age_secs() -> i64 { config::BOOKLINE_PULL_FEED_AGE_SECS }
+fn default_bookline_board_pull_on_adverse_drift() -> Decimal { config::BOOKLINE_PULL_ON_ADVERSE_DRIFT }
+fn default_bookline_board_pull_before_start_secs() -> i64 { config::BOOKLINE_PULL_BEFORE_START_SECS }
 fn default_sports_fairvalue_max_dispersion()-> Decimal { config::SPORTS_FAIRVALUE_MAX_DISPERSION       }
 fn default_sports_fairvalue_settle_hold()   -> bool    { config::SPORTS_FAIRVALUE_SETTLE_HOLD          }
 fn default_sports_fairvalue_catastrophic() -> bool    { config::SPORTS_FAIRVALUE_CATASTROPHIC_ARMED   }
@@ -1179,6 +1190,36 @@ pub struct DynamicConfig {
     /// Sanity bound on the board lane's simultaneous simulated markets.
     #[serde(default = "default_bookline_board_max_open_markets")]
     pub bookline_board_max_open_markets: usize,
+    /// The board lane's own copy of each Bookline parameter that decides a quote,
+    /// a pull or a fill. The lane runs off the GLOBAL row and the Bookline card
+    /// patches a SQUADRON row, so the squadron lane's values never reach it; these
+    /// are the only path by which an operator can tune it at all. They start at
+    /// the same compile-time defaults as the squadron lane's (`config::BOOKLINE_*`,
+    /// so a risk profile seeds both alike) and diverge only when the operator
+    /// moves them, which is the lane's purpose: try a setting against the whole
+    /// board before carrying it to the squadron.
+    #[serde(default = "default_bookline_board_base_edge")]
+    pub bookline_board_base_edge: Decimal,
+    #[serde(default = "default_bookline_board_min_edge")]
+    pub bookline_board_min_edge: Decimal,
+    #[serde(default = "default_bookline_board_edge_taper_secs")]
+    pub bookline_board_edge_taper_secs: i64,
+    #[serde(default = "default_bookline_board_drift_mult")]
+    pub bookline_board_drift_mult: Decimal,
+    #[serde(default = "default_bookline_board_min_consensus")]
+    pub bookline_board_min_consensus: Decimal,
+    #[serde(default = "default_bookline_board_min_books")]
+    pub bookline_board_min_books: i64,
+    #[serde(default = "default_bookline_board_max_dispersion")]
+    pub bookline_board_max_dispersion: Decimal,
+    #[serde(default = "default_bookline_board_max_feed_age_secs")]
+    pub bookline_board_max_feed_age_secs: i64,
+    #[serde(default = "default_bookline_board_pull_feed_age_secs")]
+    pub bookline_board_pull_feed_age_secs: i64,
+    #[serde(default = "default_bookline_board_pull_on_adverse_drift")]
+    pub bookline_board_pull_on_adverse_drift: Decimal,
+    #[serde(default = "default_bookline_board_pull_before_start_secs")]
+    pub bookline_board_pull_before_start_secs: i64,
     /// Widest book disagreement a sports FairValue entry will accept.
     #[serde(default = "default_sports_fairvalue_max_dispersion")]
     pub sports_fairvalue_max_dispersion:  Decimal,
@@ -1466,6 +1507,17 @@ impl Default for DynamicConfig {
             bookline_resting_tp_edge: config::BOOKLINE_RESTING_TP_EDGE,
             bookline_board_lane_enabled: config::BOOKLINE_BOARD_LANE_ENABLED,
             bookline_board_max_open_markets: config::BOOKLINE_BOARD_MAX_OPEN_MARKETS,
+            bookline_board_base_edge: config::BOOKLINE_BASE_EDGE,
+            bookline_board_min_edge: config::BOOKLINE_MIN_EDGE,
+            bookline_board_edge_taper_secs: config::BOOKLINE_EDGE_TAPER_SECS,
+            bookline_board_drift_mult: config::BOOKLINE_DRIFT_MULT,
+            bookline_board_min_consensus: config::BOOKLINE_MIN_CONSENSUS,
+            bookline_board_min_books: config::BOOKLINE_MIN_BOOKS,
+            bookline_board_max_dispersion: config::BOOKLINE_MAX_DISPERSION,
+            bookline_board_max_feed_age_secs: config::BOOKLINE_MAX_FEED_AGE_SECS,
+            bookline_board_pull_feed_age_secs: config::BOOKLINE_PULL_FEED_AGE_SECS,
+            bookline_board_pull_on_adverse_drift: config::BOOKLINE_PULL_ON_ADVERSE_DRIFT,
+            bookline_board_pull_before_start_secs: config::BOOKLINE_PULL_BEFORE_START_SECS,
             sports_fairvalue_max_dispersion:  config::SPORTS_FAIRVALUE_MAX_DISPERSION,
             sports_fairvalue_settle_hold:     config::SPORTS_FAIRVALUE_SETTLE_HOLD,
             sports_fairvalue_catastrophic_armed: config::SPORTS_FAIRVALUE_CATASTROPHIC_ARMED,
@@ -1638,6 +1690,12 @@ impl DynamicConfig {
     /// than a validation error the operator has to discover from behavior.
     pub fn bookline_pull_feed_age(&self) -> i64 {
         self.bookline_pull_feed_age_secs.max(self.bookline_max_feed_age_secs)
+    }
+
+    /// The board lane's hold-side feed bar, floored at its own entry bar for the
+    /// same reason as `bookline_pull_feed_age`.
+    pub fn bookline_board_pull_feed_age(&self) -> i64 {
+        self.bookline_board_pull_feed_age_secs.max(self.bookline_board_max_feed_age_secs)
     }
 }
 
@@ -2149,6 +2207,17 @@ mod tests {
             "bookline_resting_tp_edge",
             "bookline_board_lane_enabled",
             "bookline_board_max_open_markets",
+            "bookline_board_base_edge",
+            "bookline_board_min_edge",
+            "bookline_board_edge_taper_secs",
+            "bookline_board_drift_mult",
+            "bookline_board_min_consensus",
+            "bookline_board_min_books",
+            "bookline_board_max_dispersion",
+            "bookline_board_max_feed_age_secs",
+            "bookline_board_pull_feed_age_secs",
+            "bookline_board_pull_on_adverse_drift",
+            "bookline_board_pull_before_start_secs",
         ] {
             assert!(obj.remove(added).is_some(), "{added} must be a serialized field");
         }

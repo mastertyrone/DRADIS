@@ -69,6 +69,10 @@ pub fn scope_for_group(group: &str) -> Option<ConfigScope> {
     Some(match group {
         // Instance-wide: rendered in Setup, read from the global row.
         "Global" | "Deployment" | "GBoost Training" => ConfigScope::Global,
+        // Bookline's board lane: one task per instance off the sports ledger,
+        // reading the global row. Its own group rather than a corner of the Sports
+        // Raptor card, because it now carries Bookline's full quoting rule.
+        "Bookline Board Lane" => ConfigScope::Global,
         // A Raptor's own feed settings: one Raptor serves the whole instance and reads
         // them off the global watch rather than a squadron snapshot. Rendered on that
         // Raptor's card in Setup, via `settings_group` in `RAPTOR_SOURCES`.
@@ -1131,14 +1135,44 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
         v.push(F::new(sports, None, "sports_ledger_quota_reset_day", "Quota Reset Day", "int", true,
             "Day of the month (UTC) your Odds API quota resets, shown on your account page. Days after the 28th are treated as the 28th.")
             .range(1.0, 28.0).step(1.0));
-        // Bookline's board lane lives on the Sports Raptor card, not the Bookline
-        // card: it runs in one task per instance off the ledger's snapshots and
-        // reads the GLOBAL config row, so a squadron-scoped knob would have no
-        // squadron to belong to.
-        v.push(F::new(sports, None, "bookline_board_lane_enabled", "Bookline Board Lane", "bool", true,
+        // ── Bookline board lane (instance-wide, simulated) ────────────────────
+        //
+        // Global, not on the Bookline card: `scope_for_group("Bookline")` is
+        // Squadron, so that card patches the squadron row and says so ("Changes
+        // here only affect this squadron"), while this lane reads the global row.
+        // Deployed with only its switch and cap exposed, the lane sat on
+        // compile-time defaults with no way to move them: an operator lowering
+        // Base Edge on the Bookline card changed the squadron lane and nothing
+        // else. Every parameter that decides a board-lane quote, pull or fill is
+        // mirrored here under its own key. Trade size is not: the lane holds no
+        // capital and its return is per share, so shares are bookkeeping.
+        let bb = "Bookline Board Lane";
+        v.push(F::new(bb, None, "bookline_board_lane_enabled", "Enabled", "bool", false,
             "Run Bookline's quoting rule, simulated, against EVERY pre-game market on the bookmaker board using the ledger's own snapshots, not only the one market the sports squadron holds. Writes to the same simulated ledger under a separate lane and never places a venue order. Fills resolve at snapshot cadence (minutes apart), so its record is a conservative floor and is not like-for-like with the squadron lane. Needs the Sports Raptor on."));
-        v.push(F::new(sports, None, "bookline_board_max_open_markets", "Board Lane Max Open Markets", "int", true,
+        v.push(F::new(bb, None, "bookline_board_max_open_markets", "Max Open Markets", "int", true,
             "Most markets the board lane may hold simulated positions on at once. A sanity bound, not a risk control: nothing here is capital, and the Bookline card's own Max Open Markets would defeat the point of measuring the whole board.").min(1.0).step(1.0));
+        v.push(F::new(bb, None, "bookline_board_base_edge", "Base Edge", "price", true,
+            "Edge under the consensus the board lane demands when a bid has the full taper window left to rest. Starts equal to the Bookline card's Base Edge; move it here to try a different demand across the whole board. Measured on production: the best gap the market offered all evening was 0.0093 against a cheapest demand of 0.0113.").min(0.0).step(0.001));
+        v.push(F::new(bb, None, "bookline_board_min_edge", "Min Edge", "price", true,
+            "Floor on the board lane's required edge, reached exactly when the bid would be pulled and binding over the final stretch before it.").min(0.0).step(0.001));
+        v.push(F::new(bb, None, "bookline_board_edge_taper_secs", "Edge Taper", "secs", true,
+            "Seconds to kick-off at which the full Base Edge is demanded. Between here and Pull Before Kick-off the demand relaxes toward Min Edge as the square root of the time the bid has left to rest.").min(0.0).step(60.0).unit("s"));
+        v.push(F::new(bb, None, "bookline_board_drift_mult", "Drift Penalty", "decimal", true,
+            "Extra edge per point-per-hour of consensus velocity. A moving line is picked off from the direction of travel.").min(0.0).step(0.05));
+        v.push(F::new(bb, None, "bookline_board_min_consensus", "Favorite Floor", "price", true,
+            "Smallest consensus the board lane will buy. Proportional de-vig inflates consensus on longshots, so a lane that buys wherever consensus beats the bid measures the de-vig, not the book. Below 0.55 is outside the hypothesis the record is being gathered for.").range(0.0, 1.0).step(0.01));
+        v.push(F::new(bb, None, "bookline_board_min_books", "Min Books", "int", true,
+            "Fewest bookmakers behind a consensus the board lane will quote against.").min(1.0).step(1.0));
+        v.push(F::new(bb, None, "bookline_board_max_dispersion", "Max Dispersion", "price", true,
+            "Widest book disagreement (highest minus lowest book probability) the board lane will quote into. Wide dispersion is news in flight.").min(0.0).step(0.005));
+        v.push(F::new(bb, None, "bookline_board_max_feed_age_secs", "Max Feed Age To Quote", "secs", true,
+            "Oldest consensus, and oldest book snapshot, the board lane will PLACE a bid against. Entry only; what withdraws a bid is Max Feed Age To Hold. Keep this at or above the gap between the ledger's pre-game snapshot offsets or the lane can quote only in the minutes after each snapshot.").min(0.0).step(30.0).unit("s"));
+        v.push(F::new(bb, None, "bookline_board_pull_feed_age_secs", "Max Feed Age To Hold", "secs", true,
+            "Oldest consensus that still leaves a resting board-lane bid in the book. Never applied tighter than Max Feed Age To Quote.").min(0.0).step(60.0).unit("s"));
+        v.push(F::new(bb, None, "bookline_board_pull_on_adverse_drift", "Pull On Adverse Drift", "price", true,
+            "Consensus movement against a resting board-lane bid, in points from the consensus it was placed against, that pulls it.").min(0.0).step(0.005));
+        v.push(F::new(bb, None, "bookline_board_pull_before_start_secs", "Pull Before Kick-off", "secs", true,
+            "Seconds before kick-off at which the board lane stops quoting and pulls what rests. The free feed goes stale at kick-off and in-play is out of scope. This is also where the edge taper bottoms out at Min Edge.").min(0.0).step(60.0).unit("s"));
         v.push(F::new(tennis, e, "tennis_tour", "Tennis Tour", "string", true,
             "Live Tennis API tour filter: atp, wta, challenger, itf, juniors — or blank for all tours. ⚠️ Not validated, and this one fails SILENTLY: a misspelt tour returns an empty match list, which is indistinguishable from tennis being off-season or between sessions. Leave blank if unsure."));
     }

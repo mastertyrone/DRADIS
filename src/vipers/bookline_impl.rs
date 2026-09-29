@@ -201,10 +201,24 @@ pub fn line_usable(
 /// Two inputs, and both are about how far the line can travel against a bid
 /// before it fills.
 ///
-/// **Time to kick-off**, tapered as `base * sqrt(T / taper)` and floored at
-/// `min_edge`. The further from the game, the more the line can move, so the more
-/// edge is demanded; inside the taper the requirement relaxes toward the floor.
-/// Capped at `base` so a game three days out is not asked for an absurd edge.
+/// **Time left to rest**, tapered as `base * sqrt(remaining / span)` and floored
+/// at `min_edge`, where `remaining` is the time until the bid is PULLED
+/// (`secs_to_start - pull_before_start_secs`) and `span` is the resting window
+/// that demands the full base edge (`taper_secs - pull_before_start_secs`). The
+/// further from the pull, the more the line can move, so the more edge is
+/// demanded; toward the pull the requirement relaxes to the floor. Capped at
+/// `base` so a game three days out is not asked for an absurd edge.
+///
+/// Measured from the pull, not from kick-off, because the line can only hurt a
+/// bid while the bid is in the book, and the bid leaves the book at the pull.
+/// The first cut measured from kick-off: with a base of 0.02, a taper of 3600
+/// and a pull at 900, the edge at the pull was still `0.02 * sqrt(0.25) = 0.01`,
+/// and the 0.005 floor was reached only at 225 seconds to kick-off, long after
+/// the bid had been pulled. `min_edge` could never bind, so the knob did nothing
+/// and the effective floor was double the configured one. On production the
+/// best gap the market offered all evening was 0.0093 against a cheapest demand
+/// of 0.0113, on the tightest-booked game of the slate. Now the floor is reached
+/// exactly at the pull and binds over the final stretch before it.
 ///
 /// **Line velocity**, added as `drift.abs() * drift_mult`. This is the input
 /// FairValue has no analogue for: the crypto model derives its uncertainty from a
@@ -220,13 +234,17 @@ pub fn required_edge(
     base: Decimal,
     min_edge: Decimal,
     taper_secs: i64,
+    pull_before_start_secs: i64,
     drift_mult: Decimal,
 ) -> Decimal {
-    let t = secs_to_start.max(0);
-    let taper = taper_secs.max(1);
-    // sqrt(T / taper) in Decimal: the ratio is small and the sqrt is only a
+    let pull = pull_before_start_secs.max(0);
+    let remaining = (secs_to_start - pull).max(0);
+    // A taper at or inside the pull leaves no window to taper over: the full base
+    // is then asked for the whole resting life, which is the conservative reading.
+    let span = (taper_secs - pull).max(1);
+    // sqrt(remaining / span) in Decimal: the ratio is small and the sqrt is only a
     // taper shape, so the f64 hop is safe here in a way the tick grid was not.
-    let ratio = (t as f64 / taper as f64).sqrt();
+    let ratio = (remaining as f64 / span as f64).sqrt();
     let scaled = base * Decimal::try_from(ratio).unwrap_or(Decimal::ONE);
     let time_term = scaled.min(base).max(min_edge);
     // Per HOUR, not per poll. `SportsLine.drift` is a bare difference between two
@@ -465,13 +483,24 @@ mod tests {
 
     #[test]
     fn the_required_edge_relaxes_toward_kick_off_and_widens_with_a_moving_line() {
-        let e = |t, drift| required_edge(t, drift, dec!(0.02), dec!(0.005), 3600, dec!(0.5));
+        // Base 0.02, floor 0.005, full base at 3600s to kick-off, pull at 900s.
+        let e = |t, drift| required_edge(t, drift, dec!(0.02), dec!(0.005), 3600, 900, dec!(0.5));
 
         assert_eq!(e(86_400, None), dec!(0.02), "capped at base a day out");
         assert_eq!(e(3600, None), dec!(0.02), "at the taper the full base is asked");
-        assert!(e(900, None) < dec!(0.02) && e(900, None) > dec!(0.005));
+        assert!(e(2250, None) < dec!(0.02) && e(2250, None) > dec!(0.005), "tapering inside the window");
+        assert!(e(1500, None) < e(2250, None), "closer to the pull asks less");
+
+        // The floor is a floor on a RESTING bid: it must be reachable while the
+        // bid is still in the book. Measured from kick-off it never was (0.01 at
+        // the pull); measured from the pull it binds over the final stretch.
+        assert_eq!(e(1000, None), dec!(0.005), "the floor binds before the pull fires");
+        assert_eq!(e(900, None), dec!(0.005), "at the pull, exactly the floor");
         assert_eq!(e(0, None), dec!(0.005), "floored at min_edge at kick-off");
         assert_eq!(e(-600, None), dec!(0.005), "a negative clock is clamped, not negated");
+
+        // A taper at or inside the pull has no window to taper over: full base.
+        assert_eq!(required_edge(2000, None, dec!(0.02), dec!(0.005), 900, 900, dec!(0.5)), dec!(0.02));
 
         // Drift is per HOUR, so the same movement over a longer interval asks less.
         let fast = e(900, Some((dec!(0.04), 3600)));
@@ -848,7 +877,7 @@ impl Strategy for BooklineStrategy {
             };
             let edge = required_edge(
                 secs_to_start, drift, dc.bookline_base_edge, dc.bookline_min_edge,
-                dc.bookline_edge_taper_secs, dc.bookline_drift_mult,
+                dc.bookline_edge_taper_secs, dc.bookline_pull_before_start_secs, dc.bookline_drift_mult,
             );
             match quote_price(consensus, bid, edge, crate::venues::sports_tick_size()) {
                 Ok(px) => {

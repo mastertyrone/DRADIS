@@ -1871,19 +1871,24 @@ mod tests {
             // account settings, neither of which is risk appetite.
             //
             // Bookline's board lane is a measurement lane off that ledger (it
-            // never reaches a venue), so its switch and sanity bound are
-            // excluded for the same reason.
+            // never reaches a venue), so its switch, its sanity bound and its
+            // own copies of the Bookline parameters (every `bookline_board_*`
+            // key) are excluded for the same reason: what an operator is
+            // trying against the whole board is not risk appetite.
             const NOT_IN_PROFILES: &[&str] = &[
                 "ghost_mode", "collateral_sweep_enabled",
                 "sports_ledger_enabled", "sports_ledger_leagues", "sports_ledger_snapshot_offsets_mins",
                 "sports_ledger_credit_reserve", "sports_ledger_quota_reset_day",
-                "bookline_board_lane_enabled", "bookline_board_max_open_markets",
             ];
+            const NOT_IN_PROFILES_PREFIX: &str = "bookline_board_";
+            let excluded_key = |k: &str| NOT_IN_PROFILES.contains(&k) || k.starts_with(NOT_IN_PROFILES_PREFIX);
             let missing: Vec<_> = schema_keys
                 .difference(&keys)
-                .filter(|k| !NOT_IN_PROFILES.contains(k))
+                .filter(|k| !excluded_key(k))
                 .collect();
             let unknown: Vec<_> = keys.difference(&schema_keys).collect();
+            let leaked: Vec<_> = keys.iter().filter(|k| k.starts_with(NOT_IN_PROFILES_PREFIX)).collect();
+            assert!(leaked.is_empty(), "profile '{name}' declares board-lane keys {leaked:?}, which must never be part of a profile");
             for excluded in NOT_IN_PROFILES {
                 assert!(
                     !keys.contains(excluded),

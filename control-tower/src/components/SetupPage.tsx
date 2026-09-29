@@ -1456,6 +1456,16 @@ const GLOBAL_CONFIG_GROUPS: { group: string; title: string; blurb: string; omit?
       'serves the BTC squadron; its plan (take-profit, stop, ask band) comes from that ' +
       'squadron\'s GBoost settings. Progress and the last decision show on the GBoost card.',
   },
+  {
+    group: 'Bookline Board Lane',
+    title: 'Bookline Board Lane',
+    blurb: 'Bookline\'s quoting rule replayed, simulated, against every pre-game market ' +
+      'on the bookmaker board from the Sports Raptor\'s own snapshots, not only the one ' +
+      'market the sports squadron holds. It never places a venue order. These are its ' +
+      'own copies of the Bookline parameters: the Bookline card on a squadron page ' +
+      'changes that squadron only. Fills resolve at snapshot cadence, so its record is ' +
+      'a floor under the squadron lane\'s, not a like-for-like sample.',
+  },
 ];
 
 function GlobalConfigPanel() {

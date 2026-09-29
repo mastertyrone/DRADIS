@@ -41,11 +41,14 @@
 //! # Where it runs
 //!
 //! One task per instance, spawned beside the ledger in `main.rs`, on the primary
-//! database (the ledger's own). It reads Bookline's parameters from the GLOBAL
-//! config row: the lane belongs to no squadron, so a squadron-scoped value has
-//! nothing to attach to. Its two knobs of its own (the switch and the open-market
-//! sanity bound) are global for the same reason and render on the Sports Raptor
-//! card. Inert without the ledger, which is its only source of rows.
+//! database (the ledger's own). It reads the GLOBAL config row: the lane belongs
+//! to no squadron, so a squadron-scoped value has nothing to attach to. Every
+//! parameter that decides one of its quotes, pulls or fills is its OWN knob
+//! (`bookline_board_*`, the "Bookline Board Lane" group in Setup), seeded from the
+//! same compile-time defaults as the squadron lane's. The first cut read the
+//! squadron lane's keys off the global row, which the Bookline card never
+//! patches (it patches a squadron row), so the lane sat on compile-time defaults
+//! with no way to move them. Inert without the ledger, its only source of rows.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -210,9 +213,9 @@ pub async fn sweep(
             Some(l) => line_usable(
                 Decimal::try_from(l.consensus).unwrap_or(Decimal::ZERO), None, l.num_books,
                 l.dispersion.and_then(|d| Decimal::try_from(d).ok()),
-                l.age_secs(now), l.secs_to_start(now), cfg.bookline_min_consensus,
-                cfg.bookline_min_books, cfg.bookline_max_dispersion,
-                cfg.bookline_pull_feed_age(), cfg.bookline_pull_before_start_secs,
+                l.age_secs(now), l.secs_to_start(now), cfg.bookline_board_min_consensus,
+                cfg.bookline_board_min_books, cfg.bookline_board_max_dispersion,
+                cfg.bookline_board_pull_feed_age(), cfg.bookline_board_pull_before_start_secs,
             ),
             None => Err(LineRefusal::NoLine),
         };
@@ -223,7 +226,7 @@ pub async fn sweep(
         let why = if !enabled {
             Some("Bookline board lane disabled")
         } else {
-            pull_reason(verdict, adverse, cfg.bookline_pull_on_adverse_drift)
+            pull_reason(verdict, adverse, cfg.bookline_board_pull_on_adverse_drift)
         };
         if let Some(why) = why {
             if db::bookline_shadow_pull(pool, row.id, why).await {
@@ -242,7 +245,10 @@ pub async fn sweep(
     let live = db::bookline_shadow_open(pool, BOOKLINE_LANE_BOARD, BOARD_ASSET).await;
     let held: HashSet<String> = live.iter().map(|r| r.condition_id.clone()).collect();
     let mut open_markets = held.len();
-    let size = cfg.bookline_trade_size_usdc;
+    // Not a knob of this lane: it holds no capital and its return is per share,
+    // so the size only sets the `shares` column. The squadron lane's compile-time
+    // default keeps the two ledgers' share counts comparable.
+    let size = crate::config::BOOKLINE_TRADE_SIZE_USDC;
 
     let from = (now - ChronoDuration::seconds(LOOKBACK_SECS)).to_rfc3339();
     let to = (now + ChronoDuration::seconds(LOOKAHEAD_SECS)).to_rfc3339();
@@ -355,8 +361,8 @@ fn replay_step(snap: &SportsLedgerRow, quote_px: Decimal, consensus_at_quote: f6
         Some(c) => line_usable(
             Decimal::try_from(c).unwrap_or(Decimal::ZERO), None, snap.num_books,
             snap.dispersion.and_then(|d| Decimal::try_from(d).ok()),
-            0, snap.secs_to_start, cfg.bookline_min_consensus, cfg.bookline_min_books,
-            cfg.bookline_max_dispersion, cfg.bookline_pull_feed_age(), cfg.bookline_pull_before_start_secs,
+            0, snap.secs_to_start, cfg.bookline_board_min_consensus, cfg.bookline_board_min_books,
+            cfg.bookline_board_max_dispersion, cfg.bookline_board_pull_feed_age(), cfg.bookline_board_pull_before_start_secs,
         ),
         None => Err(LineRefusal::NoLine),
     };
@@ -364,7 +370,7 @@ fn replay_step(snap: &SportsLedgerRow, quote_px: Decimal, consensus_at_quote: f6
         Some(c) => Decimal::try_from(consensus_at_quote).unwrap_or(c) - c,
         None => Decimal::ZERO,
     };
-    if let Some(why) = pull_reason(verdict, adverse, cfg.bookline_pull_on_adverse_drift) {
+    if let Some(why) = pull_reason(verdict, adverse, cfg.bookline_board_pull_on_adverse_drift) {
         return Replay::Pull(why);
     }
     match snap.pm_ask {
@@ -390,7 +396,7 @@ fn score_leg(
     let row_age = DateTime::parse_from_rfc3339(&leg.ts)
         .map(|t| (now - t.with_timezone(&Utc)).num_seconds().max(0))
         .unwrap_or(i64::MAX);
-    if row_age > cfg.bookline_max_feed_age_secs {
+    if row_age > cfg.bookline_board_max_feed_age_secs {
         return Err("book snapshot is older than the line the lane may quote against".into());
     }
     let consensus = Decimal::try_from(line.consensus).unwrap_or(Decimal::ZERO);
@@ -407,16 +413,17 @@ fn score_leg(
         consensus, mid, line.num_books,
         line.dispersion.and_then(|d| Decimal::try_from(d).ok()),
         line.age_secs(now), secs_to_start,
-        cfg.bookline_min_consensus, cfg.bookline_min_books, cfg.bookline_max_dispersion,
-        cfg.bookline_max_feed_age_secs, cfg.bookline_pull_before_start_secs,
+        cfg.bookline_board_min_consensus, cfg.bookline_board_min_books, cfg.bookline_board_max_dispersion,
+        cfg.bookline_board_max_feed_age_secs, cfg.bookline_board_pull_before_start_secs,
     ).map_err(|r| r.label().to_string())?;
     let drift = match (line.drift, line.drift_secs) {
         (Some(d), Some(s)) => Decimal::try_from(d).ok().map(|d| (d, s)),
         _ => None,
     };
     let edge = required_edge(
-        secs_to_start, drift, cfg.bookline_base_edge, cfg.bookline_min_edge,
-        cfg.bookline_edge_taper_secs, cfg.bookline_drift_mult,
+        secs_to_start, drift, cfg.bookline_board_base_edge, cfg.bookline_board_min_edge,
+        cfg.bookline_board_edge_taper_secs, cfg.bookline_board_pull_before_start_secs,
+        cfg.bookline_board_drift_mult,
     );
     let px = quote_price(consensus, bid, edge, crate::venues::sports_tick_size())
         .map_err(|e| e.to_string())?;
