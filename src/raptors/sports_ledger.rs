@@ -47,6 +47,7 @@
 //! work; until then this telemetry is honest but venue-specific.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use chrono::{DateTime, Datelike, Duration as ChronoDuration, NaiveDate, TimeZone, Utc};
@@ -576,6 +577,32 @@ fn board_tx() -> &'static watch::Sender<Arc<SportsBoard>> {
 /// The current board. Cheap: an `Arc` clone of the last published map.
 pub fn board() -> Arc<SportsBoard> { board_tx().borrow().clone() }
 
+/// Whether the board has SPOKEN since this process started: published at least
+/// once, seeded from the ledger's own rows, or declared empty because the ledger
+/// is off or has no key.
+///
+/// The watch channel starts holding an empty map, and an empty map is ambiguous:
+/// it is what the board looks like before the ledger's first tick, and also what
+/// it looks like when the ledger has read the slate and found nothing. A consumer
+/// that cannot tell the two apart turns a restart into a verdict on every market
+/// it holds. That happened on 2026-09-29: Bookline's board lane ticked seven
+/// seconds before the ledger seeded the board after a deploy, read `None` for
+/// its one resting quote, mapped it to "no bookmaker line for this market", and
+/// pulled a healthy 81-minute-old bid with three hours still to run. Five deploys
+/// that day meant no quote could ever have survived to fill, and a pull books no
+/// return, so the record would have understated the rule's fill rate forever
+/// while looking healthy.
+///
+/// So: a missing line on a board that has not spoken is not evidence about the
+/// market. A missing line on a board that has spoken is: the ledger no longer
+/// holds it, and a quote resting on it should come off. Never reset within a
+/// process; a board that has spoken once stays a board that speaks.
+pub fn board_ready() -> bool { BOARD_SPOKEN.load(Ordering::Acquire) }
+
+static BOARD_SPOKEN: AtomicBool = AtomicBool::new(false);
+
+fn mark_board_ready() { BOARD_SPOKEN.store(true, Ordering::Release); }
+
 /// The lines for one market's two tokens, or `None` when the board knows neither
 /// (any non-sports market, and a sports market the ledger has not matched).
 pub fn line_for(yes_token: &str, no_token: &str) -> Option<SportsMarketLine> {
@@ -593,6 +620,7 @@ pub fn publish_rows(rows: &[db::SportsLedgerRow], now: DateTime<Utc>) {
     // `board()`), and `send` fails when every receiver has been dropped, which would
     // leave the board permanently empty.
     board_tx().send_replace(Arc::new(fold_rows(&board(), rows, now)));
+    mark_board_ready();
 }
 
 /// `prev` with this snapshot's lines folded in and finished games dropped.
@@ -1366,6 +1394,13 @@ pub async fn run_sports_ledger(
                 board_tx().send_replace(Arc::new(SportsBoard::new()));
             }
         }
+        if !cfg.sports_ledger_enabled {
+            // An empty board because the ledger is OFF is the board speaking: it
+            // holds nothing, and a consumer may act on that. Marked every pass,
+            // not only on the transition, so an instance that starts with the
+            // ledger off is never mistaken for one that has not seeded yet.
+            mark_board_ready();
+        }
         if cfg.sports_ledger_enabled {
             match std::env::var(config::SPORTS_ODDS_KEY_ENV).ok().filter(|k| !k.is_empty()) {
                 Some(key) => tick(&http, &catalog, &key, &cfg, &mut st, &raptor_health_tx).await,
@@ -1375,6 +1410,7 @@ pub async fn run_sports_ledger(
                 }
                 None => {
                     board_tx().send_replace(Arc::new(SportsBoard::new()));
+                    mark_board_ready();
                 }
             }
         }
@@ -1426,6 +1462,10 @@ async fn tick(
                 info!("🏈 Sports ledger: board seeded with {} line(s) from the recorded rows", board().len());
             }
         }
+        // Seeded, with or without rows: the ledger has now read what it holds, so
+        // an empty board from here on is a slate with nothing on it, not a board
+        // that has yet to speak. Consumers gate their "no line" verdicts on this.
+        mark_board_ready();
         st.seeded = true;
     }
     if st.catalog_at.map_or(true, |t| (now - t).num_seconds() >= CATALOG_REFRESH_SECS) {
@@ -1546,6 +1586,18 @@ mod tests {
             credits_remaining: Some(99_000),
             odds_at: Some(ts.into()), pm_at: Some(ts.into()), overround: Some(1.04), raw_consensus: consensus.map(|c| c * 1.04),
         }
+    }
+
+    /// A published board is a board that has spoken, and it stays one. Consumers
+    /// gate their "no line for this market" verdicts on this, so a restart cannot
+    /// turn the pre-seed empty board into a pull on every resting quote.
+    #[test]
+    fn publishing_marks_the_board_as_having_spoken() {
+        publish_rows(&[row("spoken-yes", "Arsenal", Some(0.61), "2026-09-20T01:38:00Z", "2026-09-19T23:00:00Z")], t("2026-09-19T23:00:00Z"));
+        assert!(board_ready(), "a published board has spoken");
+        // A later publish of nothing at all does not unsay it.
+        publish_rows(&[], t("2026-09-19T23:05:00Z"));
+        assert!(board_ready(), "having spoken is not undone by an empty publish");
     }
 
     /// A snapshot becomes one line per outcome token, and a squadron finds its own

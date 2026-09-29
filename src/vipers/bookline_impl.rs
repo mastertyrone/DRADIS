@@ -1012,6 +1012,24 @@ impl Strategy for BooklineStrategy {
                 // written on any venue. Every other refusal still pulls: a longshot
                 // consensus, books that have scattered, or kick-off arriving are all
                 // reasons to be out of the book regardless of when they appeared.
+                //
+                // Except one that is not a refusal at all. The board starts every
+                // process empty and stays empty until the ledger's first tick seeds
+                // it, and this sweep can run first: after a restart the patrol is
+                // up before the ledger has read a row. A missing line on a board
+                // that has NOT SPOKEN yet says nothing about this market, and
+                // pulling on it turns every deploy into an unmeasured intervention
+                // on the record. The board lane pulled its first-ever quote this
+                // way on 2026-09-29. Leave the row alone this tick; the board will
+                // have spoken by the next. A board that HAS spoken and lacks the
+                // line is the genuine refusal below, and still pulls.
+                if dc.bookline_enabled && line.is_none() && !crate::raptors::sports_ledger::board_ready() {
+                    if crate::vipers::gate_log_permitted(STRATEGY_NAME, &ctx.crypto_filter, "board-unseeded", GATE_LOG_INTERVAL_SECS) {
+                        info!("📖 Bookline hold [{}] {}: the bookmaker board has not been published yet — not a verdict on this market (simulated)",
+                              row.market, row.side);
+                    }
+                    continue;
+                }
                 let verdict = match line.as_ref() {
                     Some(l) => line_usable(
                         Decimal::try_from(l.consensus).unwrap_or(Decimal::ZERO), None, l.num_books,

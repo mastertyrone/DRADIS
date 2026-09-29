@@ -104,6 +104,8 @@ pub struct SweepReport {
     pub live_after: usize,
     /// Markets on the board, pre-game, scored this sweep.
     pub scored: usize,
+    /// Resting quotes left untouched because the board had not spoken yet.
+    pub deferred: usize,
 }
 
 pub async fn run_bookline_board(mut config_rx: watch::Receiver<Arc<DynamicConfig>>) {
@@ -112,7 +114,11 @@ pub async fn run_bookline_board(mut config_rx: watch::Receiver<Arc<DynamicConfig
         let cfg = config_rx.borrow().clone();
         if let Some(pool) = db::pool() {
             let board = sports_ledger::board();
-            let report = sweep(pool, &cfg, &board, &mut st, Utc::now()).await;
+            let report = sweep(pool, &cfg, &board, sports_ledger::board_ready(), &mut st, Utc::now()).await;
+            if report.deferred > 0 {
+                info!("📖 Bookline board lane: bookmaker board not published yet — {} resting quote(s) left as they are",
+                      report.deferred);
+            }
             if report.quoted + report.filled + report.pulled + report.settled > 0 {
                 info!(
                     "📖 Bookline board lane: scored {} market(s) — quoted {}, filled {}, pulled {}, settled {}; {} live (simulated, snapshot cadence)",
@@ -128,12 +134,17 @@ pub async fn run_bookline_board(mut config_rx: watch::Receiver<Arc<DynamicConfig
 }
 
 /// One pass: look after what is resting or filled, then quote what the board
-/// newly offers. Takes the board as a parameter so a test can hand it one built
-/// with `fold_rows` rather than publishing to the process-wide channel.
+/// newly offers. Takes the board, and whether it has spoken, as parameters so a
+/// test can hand it one built with `fold_rows` (or an empty one in either state)
+/// rather than publishing to the process-wide channel.
+///
+/// `board_ready` is `sports_ledger::board_ready()`: whether the board has been
+/// published at least once this process. It decides what an absent line means.
 pub async fn sweep(
     pool: &sqlx::SqlitePool,
     cfg: &DynamicConfig,
     board: &SportsBoard,
+    board_ready: bool,
     st: &mut BoardLaneState,
     now: DateTime<Utc>,
 ) -> SweepReport {
@@ -209,6 +220,22 @@ pub async fn sweep(
         // bar, the line leaving the board and the switch going off all have to
         // be seen from here rather than from a snapshot that will never come.
         let line = board.get(&row.token_id);
+        // A missing line on a board that has not spoken is not a verdict on this
+        // market. The board is empty from process start until the ledger's first
+        // tick seeds it, and this lane can tick first: on 2026-09-29 it ran seven
+        // seconds ahead of the seed after a deploy, read `None` for its one
+        // resting quote, called that "no bookmaker line for this market" and
+        // pulled a healthy bid with three hours left to run. Five deploys that
+        // day meant no quote could ever survive to fill, and since a pull books
+        // no return the record would have looked healthy while understating the
+        // fill rate forever. Leave the row alone; the board will have spoken by
+        // the next tick. A board that HAS spoken and lacks the line is the
+        // genuine refusal below, and still pulls. The operator's switch is not a
+        // board verdict and is honored regardless.
+        if enabled && line.is_none() && !board_ready {
+            report.deferred += 1;
+            continue;
+        }
         let verdict = match line {
             Some(l) => line_usable(
                 Decimal::try_from(l.consensus).unwrap_or(Decimal::ZERO), None, l.num_books,
@@ -496,7 +523,7 @@ mod tests {
         let board = fold_rows(&SportsBoard::new(), &rows, now);
 
         let mut st = BoardLaneState::default();
-        let r = sweep(&pool, &cfg, &board, &mut st, now).await;
+        let r = sweep(&pool, &cfg, &board, true, &mut st, now).await;
         assert_eq!(r.scored, 2, "both pre-game markets were scored");
         assert_eq!(r.quoted, 1, "one quote, on the favorite");
 
@@ -514,7 +541,7 @@ mod tests {
         assert!(db::bookline_shadow_open(&pool, db::BOOKLINE_LANE_SQUADRON, BOARD_ASSET).await.is_empty());
 
         // The same snapshot is not scored twice, and a held market is not re-quoted.
-        let r2 = sweep(&pool, &cfg, &board, &mut st, now + ChronoDuration::seconds(60)).await;
+        let r2 = sweep(&pool, &cfg, &board, true, &mut st, now + ChronoDuration::seconds(60)).await;
         assert_eq!(r2.scored, 0);
         assert_eq!(r2.quoted, 0);
         assert_eq!(open_board(&pool).await.len(), 1);
@@ -535,7 +562,7 @@ mod tests {
         let now = t("2026-09-27T22:30:00Z");
         let board = fold_rows(&SportsBoard::new(), &first, now);
         let mut st = BoardLaneState::default();
-        assert_eq!(sweep(&pool, &cfg, &board, &mut st, now).await.quoted, 1);
+        assert_eq!(sweep(&pool, &cfg, &board, true, &mut st, now).await.quoted, 1);
         // The row's `quoted_at` is wall-clock now; the replay reads snapshots after
         // it, so the later snapshots must be stamped after the quote.
         let quoted_at = t(&open_board(&pool).await[0].quoted_at);
@@ -547,21 +574,21 @@ mod tests {
         let snap1 = vec![row("fav", "fav-a", "Chiefs", 0.70, Some(0.66), Some(0.67), &kick_after, &later1)];
         record(&pool, &snap1).await;
         let board = fold_rows(&board, &snap1, t(&later1));
-        let r = sweep(&pool, &cfg, &board, &mut st, t(&later1)).await;
+        let r = sweep(&pool, &cfg, &board, true, &mut st, t(&later1)).await;
         assert_eq!((r.filled, r.pulled), (0, 0));
 
         // Ask at the bid: fills, at snapshot time.
         let snap2 = vec![row("fav", "fav-a", "Chiefs", 0.70, Some(0.65), Some(0.66), &kick_after, &later2)];
         record(&pool, &snap2).await;
         let board = fold_rows(&board, &snap2, t(&later2));
-        let r = sweep(&pool, &cfg, &board, &mut st, t(&later2) + ChronoDuration::seconds(45)).await;
+        let r = sweep(&pool, &cfg, &board, true, &mut st, t(&later2) + ChronoDuration::seconds(45)).await;
         assert_eq!(r.filled, 1);
         let live = open_board(&pool).await;
         assert_eq!(live[0].filled_at.as_deref(), Some(later2.as_str()), "stamped with the snapshot, not the tick");
 
         // Settlement closes it fee-free with the plain return; a win here.
         db::record_sports_line_result(&pool, "fav", "fav-a", "Chiefs", 1.0).await;
-        let r = sweep(&pool, &cfg, &board, &mut st, t(&later2) + ChronoDuration::seconds(7200)).await;
+        let r = sweep(&pool, &cfg, &board, true, &mut st, t(&later2) + ChronoDuration::seconds(7200)).await;
         assert_eq!(r.settled, 1);
         assert!(open_board(&pool).await.is_empty());
         let rets = db::bookline_shadow_returns(&pool, BOOKLINE_LANE_BOARD, BOARD_ASSET).await;
@@ -589,7 +616,7 @@ mod tests {
         let now = t("2026-09-27T22:30:00Z");
         let board = fold_rows(&SportsBoard::new(), &first, now);
         let mut st = BoardLaneState::default();
-        assert_eq!(sweep(&pool, &cfg, &board, &mut st, now).await.quoted, 1);
+        assert_eq!(sweep(&pool, &cfg, &board, true, &mut st, now).await.quoted, 1);
         let quoted_at = t(&open_board(&pool).await[0].quoted_at);
 
         // A snapshot ten minutes before kick-off, ask at the bid: pulled, not filled.
@@ -598,7 +625,7 @@ mod tests {
         let snap = vec![row("g", "g-a", "Fav", 0.70, Some(0.65), Some(0.66), &kick_soon, &late)];
         record(&pool, &snap).await;
         let board = fold_rows(&board, &snap, t(&late));
-        let r = sweep(&pool, &cfg, &board, &mut st, t(&late)).await;
+        let r = sweep(&pool, &cfg, &board, true, &mut st, t(&late)).await;
         assert_eq!((r.filled, r.pulled), (0, 1));
         assert!(open_board(&pool).await.is_empty());
 
@@ -611,11 +638,11 @@ mod tests {
         let g2 = vec![row("h", "h-a", "Fav2", 0.70, Some(0.66), Some(0.68), kick2, ts2)];
         record(&pool, &g2).await;
         let board = fold_rows(&board, &g2, t(ts2));
-        assert_eq!(sweep(&pool, &cfg, &board, &mut st, t(ts2)).await.quoted, 1);
+        assert_eq!(sweep(&pool, &cfg, &board, true, &mut st, t(ts2)).await.quoted, 1);
         // Twenty-five minutes out: still resting.
-        assert_eq!(sweep(&pool, &cfg, &board, &mut st, t(ts2) + ChronoDuration::seconds(900)).await.pulled, 0);
+        assert_eq!(sweep(&pool, &cfg, &board, true, &mut st, t(ts2) + ChronoDuration::seconds(900)).await.pulled, 0);
         // Ten minutes out, no snapshot since: pulled from the clock.
-        let r = sweep(&pool, &cfg, &board, &mut st, t(kick2) - ChronoDuration::seconds(600)).await;
+        let r = sweep(&pool, &cfg, &board, true, &mut st, t(kick2) - ChronoDuration::seconds(600)).await;
         assert_eq!(r.pulled, 1);
         assert!(open_board(&pool).await.is_empty());
 
@@ -625,10 +652,77 @@ mod tests {
         let g3 = vec![row("i", "i-a", "Fav3", 0.70, Some(0.66), Some(0.68), kick3, ts3)];
         record(&pool, &g3).await;
         let board = fold_rows(&board, &g3, t(ts3));
-        assert_eq!(sweep(&pool, &cfg, &board, &mut st, t(ts3)).await.quoted, 1);
+        assert_eq!(sweep(&pool, &cfg, &board, true, &mut st, t(ts3)).await.quoted, 1);
         cfg.bookline_board_lane_enabled = false;
-        let r = sweep(&pool, &cfg, &board, &mut st, t(ts3) + ChronoDuration::seconds(60)).await;
+        let r = sweep(&pool, &cfg, &board, true, &mut st, t(ts3) + ChronoDuration::seconds(60)).await;
         assert_eq!((r.pulled, r.quoted), (1, 0));
+        assert!(open_board(&pool).await.is_empty());
+    }
+
+    /// The deploy of 2026-09-29, replayed. A bid rests on a seeded board; the
+    /// process restarts; the lane ticks before the ledger has seeded, so the board
+    /// it reads is EMPTY and has not spoken. That is not a verdict on the market,
+    /// and the bid must still be resting afterward. Once the board has spoken and
+    /// still lacks the line, the same empty board IS a verdict, and the bid comes
+    /// off. The earlier DB-backed tests all seeded a board before ticking, which
+    /// is exactly why none of them caught this.
+    #[tokio::test]
+    async fn an_unseeded_board_is_not_a_verdict_but_a_seeded_empty_one_is() {
+        let pool = test_pool().await;
+        // Production's setting on the day: a 0.01 base edge is what let a 0.58 bid
+        // under a 0.5921 consensus qualify 230 minutes out (default 0.02 does not).
+        let mut cfg = DynamicConfig::default();
+        cfg.bookline_board_base_edge = Decimal::new(1, 2);
+        let kick = "2026-09-29T23:00:00Z";
+        let ts = "2026-09-29T19:10:00Z";
+        let rows = vec![row("wnba", "lynx", "Minnesota Lynx", 0.5921, Some(0.58), Some(0.60), kick, ts)];
+        record(&pool, &rows).await;
+        let board = fold_rows(&SportsBoard::new(), &rows, t(ts));
+        let mut st = BoardLaneState::default();
+        assert_eq!(sweep(&pool, &cfg, &board, true, &mut st, t(ts)).await.quoted, 1);
+
+        // Restart: fresh state, the board as the watch channel holds it before the
+        // ledger's first tick (empty, unspoken), 81 minutes later.
+        let mut st = BoardLaneState::default();
+        let restart = t(ts) + ChronoDuration::minutes(81);
+        let r = sweep(&pool, &cfg, &SportsBoard::new(), false, &mut st, restart).await;
+        assert_eq!(r.pulled, 0, "an unpublished board is not a refusal");
+        assert_eq!(r.deferred, 1, "the resting quote was left as it was");
+        assert_eq!(open_board(&pool).await.len(), 1, "still resting");
+
+        // The ledger seeds the board from its newest snapshot, taken minutes ago
+        // as the pre-game schedule has it, and the line is back: the quote keeps
+        // resting, and the snapshot's ask (0.60) has not crossed it.
+        let fresh = vec![row("wnba", "lynx", "Minnesota Lynx", 0.5921, Some(0.58), Some(0.60), kick, &restart.to_rfc3339())];
+        record(&pool, &fresh).await;
+        let board = fold_rows(&SportsBoard::new(), &fresh, restart);
+        let r = sweep(&pool, &cfg, &board, true, &mut st, restart + ChronoDuration::seconds(60)).await;
+        assert_eq!((r.pulled, r.deferred), (0, 0));
+        assert_eq!(open_board(&pool).await.len(), 1);
+
+        // A board that has spoken and does NOT hold the market is a real verdict.
+        let r = sweep(&pool, &cfg, &SportsBoard::new(), true, &mut st, restart + ChronoDuration::seconds(120)).await;
+        assert_eq!(r.pulled, 1, "a withdrawn line still pulls");
+        assert!(open_board(&pool).await.is_empty());
+    }
+
+    /// The operator's switch is not a board verdict: off pulls even on an
+    /// unspoken board, so a disabled lane never leaves rows resting on nothing.
+    #[tokio::test]
+    async fn the_switch_pulls_even_before_the_board_has_spoken() {
+        let pool = test_pool().await;
+        let mut cfg = DynamicConfig::default();
+        cfg.bookline_board_base_edge = Decimal::new(1, 2);
+        let kick = "2026-09-29T23:00:00Z";
+        let ts = "2026-09-29T19:10:00Z";
+        let rows = vec![row("wnba", "lynx", "Minnesota Lynx", 0.5921, Some(0.58), Some(0.60), kick, ts)];
+        record(&pool, &rows).await;
+        let board = fold_rows(&SportsBoard::new(), &rows, t(ts));
+        let mut st = BoardLaneState::default();
+        assert_eq!(sweep(&pool, &cfg, &board, true, &mut st, t(ts)).await.quoted, 1);
+        cfg.bookline_board_lane_enabled = false;
+        let r = sweep(&pool, &cfg, &SportsBoard::new(), false, &mut st, t(ts) + ChronoDuration::seconds(60)).await;
+        assert_eq!((r.pulled, r.deferred), (1, 0));
         assert!(open_board(&pool).await.is_empty());
     }
 
@@ -646,7 +740,7 @@ mod tests {
         record(&pool, &rows).await;
         let board = fold_rows(&SportsBoard::new(), &rows, t(ts));
         let mut st = BoardLaneState::default();
-        let r = sweep(&pool, &cfg, &board, &mut st, t(ts)).await;
+        let r = sweep(&pool, &cfg, &board, true, &mut st, t(ts)).await;
         assert_eq!(r.quoted, 2);
         assert_eq!(open_board(&pool).await.len(), 2);
     }
