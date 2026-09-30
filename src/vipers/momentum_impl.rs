@@ -46,7 +46,7 @@
 
 use async_trait::async_trait;
 use anyhow::Result;
-use rust_decimal::Decimal;
+use rust_decimal::{Decimal, RoundingStrategy};
 use rust_decimal_macros::dec;
 use tracing::debug;
 use std::collections::HashMap;
@@ -121,6 +121,168 @@ pub const MOMENTUM_FLAT_TP_TARGET: Decimal = dec!(0.05);
 
 /// Price tick the entry band is measured on.
 const BAND_TICK: Decimal = dec!(0.01);
+
+/// The plan Momentum actually trades from an entry at `entry`: where each exit
+/// sells, what each path returns net of the fees it pays, and the win rate at
+/// which the two balance.
+///
+/// Nothing here is a new rule; it is the arithmetic of the rules in
+/// `evaluate_exit` and the venue's fee schedule, in one place, so the entry side
+/// can see the geometry it is buying. Until 2026-09-30 nothing computed it. The
+/// entry gate compared a round-trip fee with the target and passed a $0.65
+/// entry at 33% of a 15% target, while the plan it admitted needed a 55% win
+/// rate: the resting take-profit lifted at $0.75 paid one taker leg (the entry)
+/// and netted +12.9%, the stop at $0.58 paid two and cost -15.8%, so a
+/// "15% against 10%" plan whose nominal break-even is 40% breaks even at 55%.
+/// One win and one loss on consecutive hourly markets that night made +$0.21
+/// gross and -$0.13 net, on the fees alone.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PlanGeometry {
+    /// Where the take-profit sells: the target after the exit's fee floor,
+    /// rounded up to the tick and capped at the ceiling. `None` when no price
+    /// above the entry exists for it, in which case the plan cannot win.
+    pub tp_price: Option<Decimal>,
+    /// The first tick at or below `entry × (1 − stop)`, which is where the stop
+    /// actually fills: the trigger is rarely on the grid, so the bid that first
+    /// satisfies it sits a tick under it ($0.585 fires at $0.58).
+    pub stop_price: Decimal,
+    /// What a win returns per dollar of entry, net of every fee that path pays.
+    pub win_net: Decimal,
+    /// What a loss costs per dollar of entry, as a positive figure, net of both
+    /// taker legs.
+    pub loss_net: Decimal,
+    /// `loss_net / (win_net + loss_net)`: the win rate at which the plan breaks
+    /// even. 1 when it cannot win.
+    pub break_even_win_rate: Decimal,
+    /// `stop / (target + stop)` on the configured percentages, before fees,
+    /// floors and rounding: what the plan looks like on the Control Tower.
+    pub nominal_break_even: Decimal,
+    /// Whether the winning path pays an exit fee. False when the resting
+    /// take-profit is in force (a lift is a maker fill and pays nothing), true
+    /// when the take-profit is a taker sale at the bid.
+    pub win_pays_exit_fee: bool,
+}
+
+/// The first tick at or below `p`.
+fn floor_to_tick(p: Decimal) -> Decimal {
+    p.round_dp_with_strategy(2, RoundingStrategy::ToZero)
+}
+
+/// `PlanGeometry` for an entry at `entry` under the configured plan.
+///
+/// `fee_rate` is the venue's quadratic taker coefficient (the fee per share is
+/// `rate × p × (1 − p)`); passed in rather than read from the venue so the
+/// figure is the same pure function on every build and can be pinned in a test.
+/// `resting_lift` says whether the take-profit leaves by a post-only ask (one
+/// taker leg on the win path) or a taker sale (two). The take-profit is floored
+/// exactly as `evaluate_exit` floors it: against the entry leg alone for a lift,
+/// against the round trip for a taker sale, both times `tp_fee_margin_mult`.
+///
+/// `None` when `entry` is not a price.
+pub fn plan_geometry(
+    entry: Decimal,
+    configured_target: Decimal,
+    tp_fee_margin_mult: Decimal,
+    stop_pct: Decimal,
+    ceiling: Decimal,
+    resting_lift: bool,
+    fee_rate: Decimal,
+) -> Option<PlanGeometry> {
+    if entry <= Decimal::ZERO || entry >= Decimal::ONE {
+        return None;
+    }
+    let fee = |p: Decimal| if p > Decimal::ZERO && p < Decimal::ONE { fee_rate * p * (Decimal::ONE - p) } else { Decimal::ZERO };
+    let base_target = base_take_profit(entry, configured_target);
+    let legs = if resting_lift { Decimal::ONE } else { dec!(2) };
+    let floor = legs * fee_rate * (Decimal::ONE - entry) * tp_fee_margin_mult;
+    let target = base_target.max(floor);
+    let tp_price = resting_tp_price(entry, target, entry, ceiling);
+    let stop_price = floor_to_tick(entry * (Decimal::ONE - stop_pct));
+    let entry_fee = fee(entry);
+    let win_net = match tp_price {
+        Some(tp) => {
+            let exit_fee = if resting_lift { Decimal::ZERO } else { fee(tp) };
+            (tp - entry - entry_fee - exit_fee) / entry
+        }
+        None => Decimal::ZERO,
+    };
+    let loss_net = (entry - stop_price + entry_fee + fee(stop_price)) / entry;
+    let break_even_win_rate = if win_net > Decimal::ZERO && win_net + loss_net > Decimal::ZERO {
+        loss_net / (win_net + loss_net)
+    } else {
+        Decimal::ONE
+    };
+    let nominal_break_even = if base_target + stop_pct > Decimal::ZERO {
+        stop_pct / (base_target + stop_pct)
+    } else {
+        Decimal::ONE
+    };
+    Some(PlanGeometry {
+        tp_price, stop_price, win_net, loss_net, break_even_win_rate, nominal_break_even,
+        win_pays_exit_fee: !resting_lift,
+    })
+}
+
+/// Whether a Momentum take-profit on this build leaves by a resting lift.
+///
+/// The signal is honored by the Polymarket International patrol only; the
+/// Kalshi and Polymarket US traders return `false` for `MakerRestingExit` and
+/// the taker take-profit closes the position there, paying the second leg.
+fn resting_lift_in_force(dc: &crate::helpers::dynamic_config::DynamicConfig) -> bool {
+    dc.momentum_resting_tp_enabled && cfg!(feature = "intl_clob")
+}
+
+/// The break-even gate's verdict on a side, or `None` when the plan is inside
+/// the cap. Pure: enforcement is the caller's decision (`enforce`), so the
+/// verdict can be recorded while the gate is observe-only.
+pub fn break_even_exceeds_cap(geom: Option<&PlanGeometry>, cap: Decimal) -> Option<String> {
+    let g = geom?;
+    if g.break_even_win_rate > cap {
+        Some(format!(
+            "break-even win rate {:.1}% above the {:.0}% cap (nominal {:.0}%: +{:.1}% on a win, -{:.1}% on a loss, net of fees)",
+            g.break_even_win_rate * dec!(100), cap * dec!(100), g.nominal_break_even * dec!(100),
+            g.win_net * dec!(100), g.loss_net * dec!(100),
+        ))
+    } else {
+        None
+    }
+}
+
+/// The Derivatives Raptor gate's verdict on a direction, or `None` when the
+/// perp book does not contradict it.
+///
+/// Pure and always computed, whether or not the gate is enforced
+/// (`momentum_deriv_gate_enabled`): until 2026-09-30 the whole check sat
+/// behind that switch, so with it off, as production runs it, nothing ever
+/// evaluated the rule and "would this gate have refused last night's losing
+/// entry" had no answer. The verdict now rides on every entry's log line and
+/// Viper Backtrace record, so the gate can be measured for a few days before
+/// it is allowed to change what trades. A zero CVD ratio is the raptor
+/// reporting no data, not a contradiction; a zero OI delta is neutral.
+pub fn deriv_gate_verdict(bull: bool, cvd: Decimal, oi_delta_pct: Decimal, cvd_margin: Decimal, oi_unwind_block: Decimal) -> Option<&'static str> {
+    let cvd_contradicts = cvd > dec!(0) && if bull {
+        cvd <= Decimal::ONE - cvd_margin
+    } else {
+        cvd >= Decimal::ONE + cvd_margin
+    };
+    let oi_unwind = oi_delta_pct <= oi_unwind_block;
+    match (cvd_contradicts, oi_unwind) {
+        (true, true) => Some("CVD contradicts, OI unwind"),
+        (true, false) => Some("CVD contradicts"),
+        (false, true) => Some("OI unwind"),
+        (false, false) => None,
+    }
+}
+
+/// How an observe-first gate's verdict reads on a line: what it would do, and
+/// whether it is allowed to.
+fn gate_verdict_label(veto: bool, enforced: bool) -> &'static str {
+    match (veto, enforced) {
+        (true, true) => "veto",
+        (true, false) => "would veto (observe)",
+        (false, _) => "pass",
+    }
+}
 
 /// How often the card's band/crossing detail line is refreshed, and how often
 /// a band that is narrower than the operator configured is written to the log.
@@ -290,6 +452,8 @@ pub struct SpikeGates {
     pub accel_ok: bool,
     pub window_blocks: bool,
     pub fee_blocks: bool,
+    /// The break-even gate is enforced and this side's plan needs a win rate above the cap.
+    pub break_even_blocks: bool,
     pub obi_adverse: bool,
     pub obi_exhausted: bool,
     pub obi_swing: bool,
@@ -385,6 +549,7 @@ pub fn spike_blockers(g: &SpikeGates) -> Vec<&'static str> {
     if !g.accel_ok { out.push("decelerating"); }
     if g.strike.is_some() && g.window_blocks { out.push("daily window against"); }
     if g.fee_blocks { out.push("fee-dominated"); }
+    if g.break_even_blocks { out.push("break-even above cap"); }
     if g.obi_adverse { out.push("OBI adverse"); }
     if g.obi_exhausted { out.push("OBI exhausted"); }
     if g.obi_swing { out.push("OBI swing"); }
@@ -429,8 +594,29 @@ impl Strategy for MomentumStrategyImpl {
                 Some(why) => format!("off: {why}"),
                 None => format!("≤{:.2}", crossing_max),
             };
+            // The win rate the plan needs across the reachable band, net of
+            // fees, next to the figure the configured percentages suggest.
+            let break_even_txt = match (band.first(), band.last()) {
+                (Some((lo, _)), Some((_, hi))) => {
+                    let geom = |p: Decimal| plan_geometry(
+                        p, dc.momentum_target_profit_pct, dc.momentum_tp_fee_margin_mult, dc.momentum_stop_loss_pct,
+                        dc.momentum_take_profit_ceiling, resting_lift_in_force(dc), crate::venues::taker_fee_rate());
+                    match (geom(*lo), geom(*hi)) {
+                        (Some(a), Some(b)) => format!(
+                            " | break-even win rate {:.0}%–{:.0}% net of fees (nominal {:.0}%; cap {:.0}%, {})",
+                            a.break_even_win_rate.min(b.break_even_win_rate) * dec!(100),
+                            a.break_even_win_rate.max(b.break_even_win_rate) * dec!(100),
+                            a.nominal_break_even * dec!(100),
+                            dc.momentum_max_break_even_win_rate * dec!(100),
+                            if dc.momentum_break_even_gate_enforce { "enforced" } else { "observe" },
+                        ),
+                        _ => String::new(),
+                    }
+                }
+                _ => String::new(),
+            };
             crate::helpers::viper_status::report_detail(asset, "MomentumStrategy", Some(format!(
-                "entry band {reachable} (configured {configured}) | crossing {crossing_txt}")));
+                "entry band {reachable} (configured {configured}) | crossing {crossing_txt}{break_even_txt}")));
             if (reachable != configured || crossing_inert.is_some())
                 && momentum_gate_log_permitted(asset, "band warning", BAND_WARN_INTERVAL_SECS)
             {
@@ -464,22 +650,28 @@ impl Strategy for MomentumStrategyImpl {
         // ── Derivatives confirmation gate (Derivatives Raptor) ───────────────
         // A velocity spike with the perp book pushing the other way (aggressive
         // counter-taker flow) or unwinding hard (de-leveraging/squeeze) is a fade,
-        // not a trend to chase. Block the contradicted direction. Disabled by
-        // default; inert when OI/CVD report no data (zero = neutral). All-asset.
+        // not a trend to chase. Block the contradicted direction. Inert when
+        // OI/CVD report no data (zero = neutral). All-asset.
+        //
+        // Observe-first (2026-09-30). The verdict is computed on every tick
+        // whatever the switch says and is carried onto the entry's log line and
+        // its Viper Backtrace record, so the gate's calls can be read against
+        // outcomes before it is allowed to refuse anything. Only the refusal
+        // itself is behind `momentum_deriv_gate_enabled`, exactly as before.
+        let cvd = ctx.snapshot.cvd_ratio;
+        let oi_delta = ctx.snapshot.oi_delta_pct;
+        let deriv_veto_bull = deriv_gate_verdict(true, cvd, oi_delta, dc.momentum_deriv_cvd_confirm_margin, dc.momentum_deriv_oi_unwind_block);
+        let deriv_veto_bear = deriv_gate_verdict(false, cvd, oi_delta, dc.momentum_deriv_cvd_confirm_margin, dc.momentum_deriv_oi_unwind_block);
         if dc.momentum_deriv_gate_enabled {
-            let cvd = ctx.snapshot.cvd_ratio;
-            let oi_unwind = ctx.snapshot.oi_delta_pct <= dc.momentum_deriv_oi_unwind_block;
             if velocity > dec!(0) {
-                let cvd_contradicts = cvd > dec!(0) && cvd <= dec!(1) - dc.momentum_deriv_cvd_confirm_margin;
-                if cvd_contradicts || oi_unwind {
-                    debug!(" Momentum deriv-gate blocked BULL: cvd={:.2} oi_unwind={}", cvd, oi_unwind);
+                if let Some(why) = deriv_veto_bull {
+                    debug!(" Momentum deriv-gate blocked BULL: {why} (cvd={:.2} oi={:+.2}%)", cvd, oi_delta * dec!(100));
                     idle("derivatives flow contradicts move");
                     return Ok(StrategySignal::NoSignal);
                 }
             } else if velocity < dec!(0) {
-                let cvd_contradicts = cvd > dec!(0) && cvd >= dec!(1) + dc.momentum_deriv_cvd_confirm_margin;
-                if cvd_contradicts || oi_unwind {
-                    debug!(" Momentum deriv-gate blocked BEAR: cvd={:.2} oi_unwind={}", cvd, oi_unwind);
+                if let Some(why) = deriv_veto_bear {
+                    debug!(" Momentum deriv-gate blocked BEAR: {why} (cvd={:.2} oi={:+.2}%)", cvd, oi_delta * dec!(100));
                     idle("derivatives flow contradicts move");
                     return Ok(StrategySignal::NoSignal);
                 }
@@ -650,6 +842,26 @@ impl Strategy for MomentumStrategyImpl {
         if let Some(r) = &fee_reason_bull { debug!(" Momentum fee gate (BULL): {}", r); }
         if let Some(r) = &fee_reason_bear { debug!(" Momentum fee gate (BEAR): {}", r); }
 
+        // ── Break-even gate ──────────────────────────────────────────────────
+        // The fee gate above bounds what the fee costs; it does not say what the
+        // plan then needs. This is the plan as the exit will trade it, each path
+        // net of the fees it pays (`plan_geometry`), and the win rate at which
+        // it breaks even. Observe-first: the verdict is recorded on every entry
+        // and every held spike, and refuses a side only when
+        // `momentum_break_even_gate_enforce` is on.
+        let geometry = |ask: Decimal| plan_geometry(
+            ask, dc.momentum_target_profit_pct, dc.momentum_tp_fee_margin_mult, dc.momentum_stop_loss_pct,
+            dc.momentum_take_profit_ceiling, resting_lift_in_force(dc), crate::venues::taker_fee_rate());
+        let geom_bull = geometry(yes_ask);
+        let geom_bear = geometry(no_ask);
+        let be_cap = dc.momentum_max_break_even_win_rate;
+        let be_reason_bull = break_even_exceeds_cap(geom_bull.as_ref(), be_cap);
+        let be_reason_bear = break_even_exceeds_cap(geom_bear.as_ref(), be_cap);
+        let be_blocks_bull = dc.momentum_break_even_gate_enforce && be_reason_bull.is_some();
+        let be_blocks_bear = dc.momentum_break_even_gate_enforce && be_reason_bear.is_some();
+        if let Some(r) = &be_reason_bull { debug!(" Momentum break-even gate (BULL, {}): {}", if be_blocks_bull { "veto" } else { "observe" }, r); }
+        if let Some(r) = &be_reason_bear { debug!(" Momentum break-even gate (BEAR, {}): {}", if be_blocks_bear { "veto" } else { "observe" }, r); }
+
         // ── OBI adverse-direction veto ────────────────────────────────────────
         // Default to -1.0 (maximally adverse) when depth data is missing.
         let whole_book = dc.obi_use_whole_book;
@@ -754,7 +966,31 @@ impl Strategy for MomentumStrategyImpl {
 
         // Viper Backtrace: shared stash helper — called once at whichever entry
         // branch actually fires, immediately before the Entry signal is returned.
-        let stash_entry = |token: &crate::venues::core::MarketId, branch: &str, ask: rust_decimal::Decimal| {
+        //
+        // Carries the plan's geometry and the two observe-first verdicts, so a
+        // trade row can answer "what did this entry need, and what would the
+        // gates have said" after the fact. One info line per entry says the same.
+        let stash_entry = |token: &crate::venues::core::MarketId, branch: &str, bull: bool| {
+            let (ask, geom, be_reason, be_blocks, deriv_veto) = if bull {
+                (yes_ask, geom_bull, &be_reason_bull, be_blocks_bull, deriv_veto_bull)
+            } else {
+                (no_ask, geom_bear, &be_reason_bear, be_blocks_bear, deriv_veto_bear)
+            };
+            let be_label = gate_verdict_label(be_reason.is_some(), be_blocks);
+            let deriv_label = if cvd <= dec!(0) && oi_delta == dec!(0) {
+                "no data"
+            } else {
+                gate_verdict_label(deriv_veto.is_some(), dc.momentum_deriv_gate_enabled)
+            };
+            let plan = geom.map(|g| serde_json::json!({
+                "tp_price": g.tp_price.map(|p| p.to_string()),
+                "stop_price": g.stop_price.to_string(),
+                "win_net_pct": g.win_net.to_string(),
+                "loss_net_pct": g.loss_net.to_string(),
+                "break_even_win_rate": g.break_even_win_rate.to_string(),
+                "nominal_break_even": g.nominal_break_even.to_string(),
+                "win_pays_exit_fee": g.win_pays_exit_fee,
+            }));
             crate::helpers::metrics::stash_entry_signals_json(token.as_str(), serde_json::json!({
                 "viper": "Momentum",
                 "branch": branch,
@@ -764,7 +1000,29 @@ impl Strategy for MomentumStrategyImpl {
                 "strike": strike_price.map(|s| s.to_string()),
                 "drift_10m": drift_10m.to_string(),
                 "ask": ask.to_string(),
+                "plan": plan,
+                "break_even_gate": { "verdict": be_label, "cap": be_cap.to_string(), "reason": be_reason },
+                "deriv_gate": {
+                    "verdict": deriv_label, "reason": deriv_veto,
+                    "cvd": cvd.to_string(), "oi_delta_pct": oi_delta.to_string(),
+                },
             }));
+            if let Some(g) = geom {
+                tracing::info!(
+                    "📐 Momentum plan [{branch}] at ${:.2}: take-profit {} ({:+.1}% net{}), stop ${:.2} ({:.1}% net), \
+                     break-even win rate {:.1}% (nominal {:.0}%) | break-even gate: {be_label} (cap {:.0}%) \
+                     | deriv gate: {deriv_label}{} (cvd={:.2} oi={:+.2}%)",
+                    ask,
+                    g.tp_price.map(|p| format!("${p:.2}")).unwrap_or_else(|| "none".into()),
+                    g.win_net * dec!(100),
+                    if g.win_pays_exit_fee { ", taker" } else { ", lift" },
+                    g.stop_price, -g.loss_net * dec!(100),
+                    g.break_even_win_rate * dec!(100), g.nominal_break_even * dec!(100),
+                    be_cap * dec!(100),
+                    deriv_veto.map(|w| format!(": {w}")).unwrap_or_default(),
+                    cvd, oi_delta * dec!(100),
+                );
+            }
         };
 
         // ── Window/Daily trend filter ─────────────────────────────────────────
@@ -796,9 +1054,9 @@ impl Strategy for MomentumStrategyImpl {
             if velocity > threshold && binance_price > (strike + strike_buffer)
                 && yes_ask <= dc.momentum_max_entry_price
                 && yes_ask >= dc.momentum_min_entry_price
-                && short_ok_bull && accel_ok_bull && !window_blocks_bull && !fee_blocks_bull && !obi_blocks_bull && !obi_exhausted_bull && !obi_swing_blocks_bull && !drift_blocks_bull
+                && short_ok_bull && accel_ok_bull && !window_blocks_bull && !fee_blocks_bull && !be_blocks_bull && !obi_blocks_bull && !obi_exhausted_bull && !obi_swing_blocks_bull && !drift_blocks_bull
             {
-                stash_entry(&ctx.market.yes_token, "BULL_primary", yes_ask);
+                stash_entry(&ctx.market.yes_token, "BULL_primary", true);
                 return Ok(StrategySignal::Entry {
                     params: entry_params!(ctx.market.yes_token.clone(), yes_ask, ctx.market.yes_fee_bps as u16),
                     pair_params: None,
@@ -806,9 +1064,9 @@ impl Strategy for MomentumStrategyImpl {
             } else if velocity < -threshold && binance_price < (strike - strike_buffer)
                 && no_ask <= dc.momentum_max_entry_price
                 && no_ask >= dc.momentum_min_entry_price
-                && short_ok_bear && accel_ok_bear && !window_blocks_bear && !fee_blocks_bear && !obi_blocks_bear && !obi_exhausted_bear && !obi_swing_blocks_bear && !drift_blocks_bear
+                && short_ok_bear && accel_ok_bear && !window_blocks_bear && !fee_blocks_bear && !be_blocks_bear && !obi_blocks_bear && !obi_exhausted_bear && !obi_swing_blocks_bear && !drift_blocks_bear
             {
-                stash_entry(&ctx.market.no_token, "BEAR_primary", no_ask);
+                stash_entry(&ctx.market.no_token, "BEAR_primary", false);
                 return Ok(StrategySignal::Entry {
                     params: entry_params!(ctx.market.no_token.clone(), no_ask, ctx.market.no_fee_bps as u16),
                     pair_params: None,
@@ -819,9 +1077,9 @@ impl Strategy for MomentumStrategyImpl {
             if velocity > threshold && binance_price > strike
                 && yes_ask <= crossing_max
                 && yes_ask >= dc.momentum_min_entry_price
-                && short_ok_bull && accel_ok_bull && !window_blocks_bull && !fee_blocks_bull && !obi_blocks_bull && !obi_exhausted_bull && !obi_swing_blocks_bull && !drift_blocks_bull
+                && short_ok_bull && accel_ok_bull && !window_blocks_bull && !fee_blocks_bull && !be_blocks_bull && !obi_blocks_bull && !obi_exhausted_bull && !obi_swing_blocks_bull && !drift_blocks_bull
             {
-                stash_entry(&ctx.market.yes_token, "BULL_crossing", yes_ask);
+                stash_entry(&ctx.market.yes_token, "BULL_crossing", true);
                 return Ok(StrategySignal::Entry {
                     params: entry_params!(ctx.market.yes_token.clone(), yes_ask, ctx.market.yes_fee_bps as u16),
                     pair_params: None,
@@ -829,9 +1087,9 @@ impl Strategy for MomentumStrategyImpl {
             } else if velocity < -threshold && binance_price < strike
                 && no_ask <= crossing_max
                 && no_ask >= dc.momentum_min_entry_price
-                && short_ok_bear && accel_ok_bear && !window_blocks_bear && !fee_blocks_bear && !obi_blocks_bear && !obi_exhausted_bear && !obi_swing_blocks_bear && !drift_blocks_bear
+                && short_ok_bear && accel_ok_bear && !window_blocks_bear && !fee_blocks_bear && !be_blocks_bear && !obi_blocks_bear && !obi_exhausted_bear && !obi_swing_blocks_bear && !drift_blocks_bear
             {
-                stash_entry(&ctx.market.no_token, "BEAR_crossing", no_ask);
+                stash_entry(&ctx.market.no_token, "BEAR_crossing", false);
                 return Ok(StrategySignal::Entry {
                     params: entry_params!(ctx.market.no_token.clone(), no_ask, ctx.market.no_fee_bps as u16),
                     pair_params: None,
@@ -843,9 +1101,9 @@ impl Strategy for MomentumStrategyImpl {
             if velocity > threshold
                 && yes_ask <= dc.momentum_max_entry_price
                 && yes_ask >= dc.momentum_min_entry_price
-                && short_ok_bull && accel_ok_bull && !fee_blocks_bull && !obi_blocks_bull && !obi_exhausted_bull && !obi_swing_blocks_bull && !drift_blocks_bull
+                && short_ok_bull && accel_ok_bull && !fee_blocks_bull && !be_blocks_bull && !obi_blocks_bull && !obi_exhausted_bull && !obi_swing_blocks_bull && !drift_blocks_bull
             {
-                stash_entry(&ctx.market.yes_token, "BULL_nostrike", yes_ask);
+                stash_entry(&ctx.market.yes_token, "BULL_nostrike", true);
                 return Ok(StrategySignal::Entry {
                     params: entry_params!(ctx.market.yes_token.clone(), yes_ask, ctx.market.yes_fee_bps as u16),
                     pair_params: None,
@@ -853,9 +1111,9 @@ impl Strategy for MomentumStrategyImpl {
             } else if velocity < -threshold
                 && no_ask <= dc.momentum_max_entry_price
                 && no_ask >= dc.momentum_min_entry_price
-                && short_ok_bear && accel_ok_bear && !fee_blocks_bear && !obi_blocks_bear && !obi_exhausted_bear && !obi_swing_blocks_bear && !drift_blocks_bear
+                && short_ok_bear && accel_ok_bear && !fee_blocks_bear && !be_blocks_bear && !obi_blocks_bear && !obi_exhausted_bear && !obi_swing_blocks_bear && !drift_blocks_bear
             {
-                stash_entry(&ctx.market.no_token, "BEAR_nostrike", no_ask);
+                stash_entry(&ctx.market.no_token, "BEAR_nostrike", false);
                 return Ok(StrategySignal::Entry {
                     params: entry_params!(ctx.market.no_token.clone(), no_ask, ctx.market.no_fee_bps as u16),
                     pair_params: None,
@@ -887,7 +1145,7 @@ impl Strategy for MomentumStrategyImpl {
                 ask: yes_ask, min_entry: dc.momentum_min_entry_price, max_entry: dc.momentum_max_entry_price,
                 crossing_max, crossing_inert: crossing_inert.is_some(),
                 short_ok: short_ok_bull, accel_ok: accel_ok_bull, window_blocks: window_blocks_bull,
-                fee_blocks: fee_blocks_bull, obi_adverse: obi_blocks_bull, obi_exhausted: obi_exhausted_bull,
+                fee_blocks: fee_blocks_bull, break_even_blocks: be_blocks_bull, obi_adverse: obi_blocks_bull, obi_exhausted: obi_exhausted_bull,
                 obi_swing: obi_swing_blocks_bull, drift_blocks: drift_blocks_bull,
             }
         } else {
@@ -896,7 +1154,7 @@ impl Strategy for MomentumStrategyImpl {
                 ask: no_ask, min_entry: dc.momentum_min_entry_price, max_entry: dc.momentum_max_entry_price,
                 crossing_max, crossing_inert: crossing_inert.is_some(),
                 short_ok: short_ok_bear, accel_ok: accel_ok_bear, window_blocks: window_blocks_bear,
-                fee_blocks: fee_blocks_bear, obi_adverse: obi_blocks_bear, obi_exhausted: obi_exhausted_bear,
+                fee_blocks: fee_blocks_bear, break_even_blocks: be_blocks_bear, obi_adverse: obi_blocks_bear, obi_exhausted: obi_exhausted_bear,
                 obi_swing: obi_swing_blocks_bear, drift_blocks: drift_blocks_bear,
             }
         };
@@ -904,8 +1162,15 @@ impl Strategy for MomentumStrategyImpl {
         let side = if bull { "BULL" } else { "BEAR" };
         let key = format!("spike {} | {}", side, blockers.join(", "));
         let fee_reason = if bull { &fee_reason_bull } else { &fee_reason_bear };
+        let (geom, be_reason, deriv_veto) = if bull {
+            (geom_bull, &be_reason_bull, deriv_veto_bull)
+        } else {
+            (geom_bear, &be_reason_bear, deriv_veto_bear)
+        };
         let ui_reason = if gates.fee_blocks {
             fee_reason.as_deref().unwrap_or("fee-dominated entry")
+        } else if gates.break_even_blocks {
+            be_reason.as_deref().unwrap_or("break-even above cap")
         } else {
             "spike blocked by entry gates (OBI/drift/price)"
         };
@@ -921,7 +1186,7 @@ impl Strategy for MomentumStrategyImpl {
                 "{} spike held by [{}] | vel={:.2} trigger=±{:.2} 1s={:.2} (need {:.2}) accel={:.3} \
                  | oracle=${:.2} strike={} | {}_ask={:.3} (entry {:.2}–{:.2}, crossing {}) \
                  | OBI={:.2} (adverse <{:.2}, exhausted >{:.2}) swing={:.2} (max {:.2}) \
-                 | drift10m={:.2} (block {:.2}) | daily YES mid={}{}",
+                 | drift10m={:.2} (block {:.2}) | daily YES mid={}{} | break-even {} ({}, cap {:.0}%) | deriv gate {}{}",
                 side,
                 if blockers.is_empty() { "unclassified".to_string() } else { blockers.join(", ") },
                 velocity, threshold, velocity_1s, short_min, acceleration,
@@ -933,6 +1198,11 @@ impl Strategy for MomentumStrategyImpl {
                 swing, config::MOMENTUM_OBI_SWING_BLOCK,
                 drift_10m, drift_block_mag, window_txt,
                 fee_reason.as_ref().map(|r| format!(" | fee: {}", r)).unwrap_or_default(),
+                geom.map(|g| format!("{:.1}% (nominal {:.0}%)", g.break_even_win_rate * dec!(100), g.nominal_break_even * dec!(100)))
+                    .unwrap_or_else(|| "n/a".into()),
+                gate_verdict_label(be_reason.is_some(), gates.break_even_blocks), be_cap * dec!(100),
+                gate_verdict_label(deriv_veto.is_some(), dc.momentum_deriv_gate_enabled),
+                deriv_veto.map(|w| format!(": {w}")).unwrap_or_default(),
             )
         });
         Ok(StrategySignal::NoSignal)
@@ -1480,7 +1750,7 @@ mod tests {
             strike: Some((dec!(78100), dec!(78000), dec!(8))),
             ask: dec!(0.65), min_entry: dec!(0.58), max_entry: dec!(0.78), crossing_max: dec!(0.62),
             crossing_inert: false, short_ok: true, accel_ok: true, window_blocks: false, fee_blocks: false,
-            obi_adverse: false, obi_exhausted: false, obi_swing: false, drift_blocks: false,
+            break_even_blocks: false, obi_adverse: false, obi_exhausted: false, obi_swing: false, drift_blocks: false,
         }
     }
 
@@ -1488,6 +1758,175 @@ mod tests {
     #[test]
     fn spike_blockers_empty_when_every_gate_passes() {
         assert!(spike_blockers(&clean_bull_spike()).is_empty());
+    }
+
+    /// The enforced break-even gate is named among the blockers.
+    #[test]
+    fn spike_blockers_names_the_break_even_gate() {
+        let mut g = clean_bull_spike();
+        g.break_even_blocks = true;
+        assert_eq!(spike_blockers(&g), vec!["break-even above cap"]);
+    }
+
+    // ── The plan's geometry, pinned at the observed trades ───────────────────
+    //
+    // 2026-09-29 overnight, Polymarket International, two real entries on
+    // consecutive hourly BTC markets, both YES at $0.65, 7 shares, 15% target,
+    // 10% stop, 7% fee rate, resting take-profit on:
+    //   lifted at $0.75:  +$0.70 gross, -$0.1115 fees, +$0.5885 net
+    //   stopped at $0.58: -$0.49 gross, -$0.2308 fees, -$0.7208 net
+    // +$0.21 gross, -$0.13 net. The plan reads "15 against 10" (break-even 40%)
+    // and trades +12.9% against -15.8% (break-even 55%).
+
+    const OBSERVED_ENTRY: Decimal = dec!(0.65);
+
+    fn observed_plan(resting_lift: bool) -> PlanGeometry {
+        plan_geometry(OBSERVED_ENTRY, dec!(0.15), dec!(1.35), dec!(0.10), dec!(0.90), resting_lift, dec!(0.07))
+            .expect("a price")
+    }
+
+    fn close(a: Decimal, b: Decimal, tol: Decimal) -> bool { (a - b).abs() <= tol }
+
+    #[test]
+    fn the_observed_plan_sells_where_the_trades_sold() {
+        let g = observed_plan(true);
+        assert_eq!(g.tp_price, Some(dec!(0.75)), "$0.65 × 1.15 = $0.7475 rests at the $0.75 tick");
+        assert_eq!(g.stop_price, dec!(0.58), "the stop triggers at $0.585 and the first bid at or under it is $0.58");
+        assert!(!g.win_pays_exit_fee, "a lift is a maker fill");
+        assert!(close(g.nominal_break_even, dec!(0.40), dec!(0.0001)));
+    }
+
+    #[test]
+    fn the_observed_plan_nets_what_the_ledger_booked() {
+        let g = observed_plan(true);
+        // Per share of entry: +$0.10 - $0.0159 entry fee on the win, -$0.07 - $0.0159 - $0.0171 stop fee on the loss.
+        assert!(close(g.win_net, dec!(0.1293), dec!(0.0005)), "win {}", g.win_net);
+        assert!(close(g.loss_net, dec!(0.1584), dec!(0.0005)), "loss {}", g.loss_net);
+        // Seven shares at $0.65 is $4.55 of entry.
+        let stake = OBSERVED_ENTRY * dec!(7);
+        assert!(close(g.win_net * stake, dec!(0.5885), dec!(0.001)), "the lifted trade netted +$0.5885");
+        assert!(close(-g.loss_net * stake, dec!(-0.7208), dec!(0.001)), "the stopped trade netted -$0.7208");
+    }
+
+    #[test]
+    fn the_observed_plan_breaks_even_at_fifty_five_percent_not_forty() {
+        let g = observed_plan(true);
+        assert!(close(g.break_even_win_rate, dec!(0.5505), dec!(0.001)), "{}", g.break_even_win_rate);
+        assert!(g.break_even_win_rate > g.nominal_break_even + dec!(0.14));
+        // One win and one loss at these figures is a net loss on the fees alone.
+        let stake = OBSERVED_ENTRY * dec!(7);
+        assert!(close((g.win_net - g.loss_net) * stake, dec!(-0.13), dec!(0.005)));
+    }
+
+    /// Where the take-profit is a taker sale (resting off, or Kalshi and
+    /// Polymarket US, which ignore the resting signal) the win pays a second
+    /// leg and the bar is higher still.
+    #[test]
+    fn a_taker_take_profit_pays_a_second_leg_and_needs_more_wins() {
+        let lift = observed_plan(true);
+        let taker = observed_plan(false);
+        assert!(taker.win_pays_exit_fee);
+        assert_eq!(taker.tp_price, Some(dec!(0.75)));
+        // The exit fee at $0.75 is $0.013125 a share, 2.0% of the entry.
+        assert!(close(lift.win_net - taker.win_net, dec!(0.0202), dec!(0.0005)));
+        assert!(taker.break_even_win_rate > lift.break_even_win_rate);
+        assert!(close(taker.break_even_win_rate, dec!(0.5921), dec!(0.001)), "{}", taker.break_even_win_rate);
+    }
+
+    /// The fee gate's own arithmetic at the same entry, for the record: the
+    /// round trip is 4.9% of notional, 33% of the 15% target, under the 40% cap.
+    /// It passes a plan that needs 55% wins because it never looks at the stop.
+    #[test]
+    fn the_fee_share_gate_passes_the_observed_plan() {
+        // 2 × 0.07 × (1 − 0.65) = 0.049; the gate reads the venue rate, so only the
+        // shape is pinned here (the number is 0.049 on the 7% venues, 0.042 on Polymarket US).
+        let fee = crate::venues::round_trip_fee_pct(OBSERVED_ENTRY);
+        assert!(fee / dec!(0.15) < dec!(0.40));
+        assert!(crate::vipers::fee_dominated_entry(OBSERVED_ENTRY, dec!(0.15), dec!(0.40)).is_none());
+    }
+
+    /// Above the flat-target floor the geometry is far worse than the card
+    /// suggests: a 5% target against a 10% stop needs about 78% wins at $0.80.
+    #[test]
+    fn the_flat_target_above_seventy_cents_needs_most_trades_to_win() {
+        let g = plan_geometry(dec!(0.80), dec!(0.15), dec!(1.35), dec!(0.10), dec!(0.90), true, dec!(0.07)).unwrap();
+        assert_eq!(g.tp_price, Some(dec!(0.84)));
+        assert_eq!(g.stop_price, dec!(0.72));
+        assert!(close(g.nominal_break_even, dec!(0.6667), dec!(0.001)));
+        assert!(close(g.break_even_win_rate, dec!(0.785), dec!(0.002)), "{}", g.break_even_win_rate);
+    }
+
+    /// The ceiling caps the sale, and an entry the ceiling leaves nothing above
+    /// cannot win: its break-even is 1.
+    #[test]
+    fn the_ceiling_caps_the_take_profit_and_can_remove_it() {
+        let capped = plan_geometry(dec!(0.88), dec!(0.15), dec!(1.35), dec!(0.10), dec!(0.90), true, dec!(0.07)).unwrap();
+        assert_eq!(capped.tp_price, Some(dec!(0.90)), "$0.88 × 1.05 = $0.924 is capped at the $0.90 ceiling");
+        let none = plan_geometry(dec!(0.90), dec!(0.15), dec!(1.35), dec!(0.10), dec!(0.90), true, dec!(0.07)).unwrap();
+        assert_eq!(none.tp_price, None);
+        assert_eq!(none.win_net, Decimal::ZERO);
+        assert_eq!(none.break_even_win_rate, Decimal::ONE);
+        assert!(plan_geometry(Decimal::ZERO, dec!(0.15), dec!(1.35), dec!(0.10), dec!(0.90), true, dec!(0.07)).is_none());
+        assert!(plan_geometry(Decimal::ONE, dec!(0.15), dec!(1.35), dec!(0.10), dec!(0.90), true, dec!(0.07)).is_none());
+    }
+
+    /// The exit's fee floor is part of the plan: where it lifts the target the
+    /// take-profit rests higher, and the geometry says so.
+    #[test]
+    fn the_fee_floor_lifts_a_target_that_would_not_clear_the_fee() {
+        // A 2% target at $0.30 is under the one-leg floor of 0.07 × 0.70 × 1.35 = 6.6%.
+        let g = plan_geometry(dec!(0.30), dec!(0.02), dec!(1.35), dec!(0.10), dec!(0.90), true, dec!(0.07)).unwrap();
+        assert_eq!(g.tp_price, Some(dec!(0.32)), "$0.30 × 1.066 = $0.3198 rests at $0.32");
+        // The taker variant floors against the round trip, so it rests higher again.
+        let t = plan_geometry(dec!(0.30), dec!(0.02), dec!(1.35), dec!(0.10), dec!(0.90), false, dec!(0.07)).unwrap();
+        assert_eq!(t.tp_price, Some(dec!(0.34)));
+    }
+
+    /// With no fee the plan is exactly what the percentages say, up to the tick.
+    #[test]
+    fn without_a_fee_the_break_even_is_the_nominal_one() {
+        let g = plan_geometry(dec!(0.50), dec!(0.15), dec!(1.35), dec!(0.10), dec!(0.90), true, Decimal::ZERO).unwrap();
+        assert_eq!(g.tp_price, Some(dec!(0.58)));
+        assert_eq!(g.stop_price, dec!(0.45));
+        assert!(close(g.win_net, dec!(0.16), dec!(0.0001)));
+        assert!(close(g.loss_net, dec!(0.10), dec!(0.0001)));
+        assert!(close(g.break_even_win_rate, dec!(0.3846), dec!(0.001)));
+        assert!(close(g.nominal_break_even, dec!(0.40), dec!(0.0001)));
+    }
+
+    /// The gate's verdict is a function of the cap alone; enforcement is the
+    /// caller's, so an observe-only build reports the same verdict it would act on.
+    #[test]
+    fn the_break_even_gate_reports_the_verdict_it_would_enforce() {
+        let g = observed_plan(true);
+        let over = break_even_exceeds_cap(Some(&g), dec!(0.50)).expect("55% is above a 50% cap");
+        assert!(over.starts_with("break-even win rate 55.0% above the 50% cap") || over.starts_with("break-even win rate 55.1% above the 50% cap"), "{over}");
+        assert!(over.contains("nominal 40%"), "{over}");
+        assert!(break_even_exceeds_cap(Some(&g), dec!(0.56)).is_none());
+        assert!(break_even_exceeds_cap(None, dec!(0.50)).is_none(), "no price, no verdict");
+        assert_eq!(gate_verdict_label(true, false), "would veto (observe)");
+        assert_eq!(gate_verdict_label(true, true), "veto");
+        assert_eq!(gate_verdict_label(false, true), "pass");
+    }
+
+    // ── The derivatives gate's verdict, computed whether or not it is enforced ──
+
+    #[test]
+    fn the_deriv_verdict_reads_cvd_and_oi_per_direction() {
+        let (margin, unwind) = (dec!(0.15), dec!(-0.05));
+        // Counter-taker flow against a bull: cvd at or under 0.85.
+        assert_eq!(deriv_gate_verdict(true, dec!(0.85), dec!(0), margin, unwind), Some("CVD contradicts"));
+        assert_eq!(deriv_gate_verdict(true, dec!(0.86), dec!(0), margin, unwind), None);
+        // The same flow confirms a bear; a bear is contradicted at or above 1.15.
+        assert_eq!(deriv_gate_verdict(false, dec!(0.85), dec!(0), margin, unwind), None);
+        assert_eq!(deriv_gate_verdict(false, dec!(1.15), dec!(0), margin, unwind), Some("CVD contradicts"));
+        // Hard OI unwind blocks both directions.
+        assert_eq!(deriv_gate_verdict(true, dec!(1.0), dec!(-0.05), margin, unwind), Some("OI unwind"));
+        assert_eq!(deriv_gate_verdict(false, dec!(1.0), dec!(-0.06), margin, unwind), Some("OI unwind"));
+        assert_eq!(deriv_gate_verdict(true, dec!(0.80), dec!(-0.06), margin, unwind), Some("CVD contradicts, OI unwind"));
+        // A zero CVD ratio is no data, never a contradiction.
+        assert_eq!(deriv_gate_verdict(true, dec!(0), dec!(0), margin, unwind), None);
+        assert_eq!(deriv_gate_verdict(false, dec!(0), dec!(0), margin, unwind), None);
     }
 
     /// The price blocker follows the two entry branches: inside the strike

@@ -99,6 +99,8 @@ export interface DynamicConfig {
   momentum_obi_exhaust_persist_secs:     number;
   momentum_tp_fee_margin_mult:           string;
   momentum_max_fee_to_target_ratio:      string;
+  momentum_max_break_even_win_rate:      string;
+  momentum_break_even_gate_enforce:      boolean;
   momentum_reversal_ratio:               string;
   momentum_reversal_min_hold_secs:       number;
   momentum_reversal_persist_secs:        number;

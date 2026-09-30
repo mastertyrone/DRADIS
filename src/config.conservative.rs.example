@@ -298,6 +298,27 @@ pub const MOMENTUM_OBI_EXHAUST_PERSIST_SECS: i64 = 20;
 /// so the gate never binds there. Conservative: 0.40 — the fee may be at most 40% of the target.
 pub const MOMENTUM_MAX_FEE_TO_TARGET_RATIO: Decimal = dec!(0.40);
 
+/// Highest fee-adjusted break-even win rate a Momentum plan may need before an
+/// entry is refused, and whether that refusal is enforced.
+///
+/// The fee-share gate above bounds what the fee costs; it does not say what the
+/// plan then needs. This does: the take-profit and stop the exit will actually
+/// use (tick-rounded, floored against their fees, capped at the ceiling), the
+/// winning leg paying one taker fee when the resting take-profit is in force and
+/// two otherwise, the losing leg always paying two. A 15% target against a 10%
+/// stop reads as a 40% break-even; net of Polymarket International's 7% fee it
+/// is 55% at a $0.65 entry, and 78% at $0.80 where the flat 5% target applies.
+/// 2026-09-29 overnight: one lift at $0.75 and one stop at $0.58 from two $0.65
+/// entries made +$0.21 gross and -$0.13 net.
+///
+/// Observe-first, like MAKER_HORIZON_GATE_ENFORCE: with ENFORCE false the verdict
+/// is computed and recorded on every entry (log line and Viper Backtrace) and on
+/// every held spike, and nothing is refused. 0.50 is "the plan must be profitable
+/// at a coin flip"; enforcing it at the current 15%/10% plan refuses the whole
+/// $0.58-$0.69 band, so the cap and the plan are a decision to make together.
+pub const MOMENTUM_MAX_BREAK_EVEN_WIN_RATE: Decimal = dec!(0.50);
+pub const MOMENTUM_BREAK_EVEN_GATE_ENFORCE: bool = false;
+
 /// How long the oracle must read reversed, continuously, before the Momentum
 /// reversal exit fires. `velocity` is a 5s window (MOMENTUM_WINDOW_SECS), so one
 /// opposing tick reads as a reversal for up to five seconds on its own; anything

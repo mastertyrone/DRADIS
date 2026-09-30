@@ -324,8 +324,12 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
              likely to be the open's own noise rather than a move: on 2026-09-24 Momentum bought six seconds \
              into a window and gave back 23% in under a minute. 0 restores the old behavior."
         ).min(0.0).step(1.0).unit("s"));
-        v.push(F::new(g, e, "momentum_deriv_gate_enabled", "Deriv Gate", "bool", true,
-            "Derivatives-Raptor confirmation gate: block entries the perp book contradicts (counter CVD flow or hard OI unwind). Inert when OI/CVD report no data."));
+        v.push(F::new(g, e, "momentum_deriv_gate_enabled", "Deriv Gate Enforce", "bool", true,
+            "Derivatives-Raptor confirmation gate: block entries the perp book contradicts (counter CVD flow or hard \
+             OI unwind). Inert when OI/CVD report no data. Observe-first: the verdict (pass, would veto, no data) is \
+             computed on every entry whatever this says and written to the entry's log line and its Viper Backtrace \
+             record, so what the gate would have refused can be read against outcomes for a few days before it is \
+             switched on. On = refuse the contradicted direction."));
         v.push(F::new(g, e, "momentum_deriv_cvd_confirm_margin", "Deriv CVD Margin", "decimal", true,
             "Distance from neutral CVD ratio 1.0 that blocks the contradicted direction (0.15 ⇒ ≤0.85 blocks bulls, ≥1.15 blocks bears).").range(0.0, 1.0).step(0.01));
         v.push(F::new(g, e, "momentum_deriv_oi_unwind_block", "Deriv OI Unwind Block", "decimal", true,
@@ -346,8 +350,24 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
              and 116% of the gross loss. 0.40 lets the fee take at most 40% of the target; on Polymarket International \
              with the aggressive profile that admits entries at roughly $0.58–$0.69 and nothing else, and with the \
              balanced profile (10% target, $0.60 max entry) it admits nothing. On Polymarket US (0.06) the same \
-             $0.53 entry is 38% of a 15% plan and passes; the balanced profile still admits nothing there.")
+             $0.53 entry is 38% of a 15% plan and passes; the balanced profile still admits nothing there. This bounds \
+             what the fee costs, not what the plan then needs: see Break-Even Cap for the win rate the plan requires.")
             .range(0.0, 1.0).step(0.05));
+        v.push(F::new(g, e, "momentum_max_break_even_win_rate", "Break-Even Cap", "decimal", true,
+            "Highest fee-adjusted break-even win rate the plan may need at an entry price before the break-even gate \
+             refuses it. Computed from the take-profit and stop the exit will actually use (tick-rounded, floored \
+             against their fees, capped at the Take-Profit Ceiling), with the winning leg paying one taker fee when \
+             the Resting Take Profit is in force and two otherwise, and the losing leg always paying two. A 15% \
+             target against a 10% stop reads as a 40% break-even; net of Polymarket International's 7% fee it is 55% \
+             at a $0.65 entry, 51% at $0.69, and 78% at $0.80 where the flat 5% target applies. The card shows the \
+             range across the reachable band. 0.50 means the plan must be profitable at a coin flip; enforcing that \
+             at 15%/10% refuses the whole $0.58–$0.69 band, so set the cap and the plan together. Only refuses when \
+             Break-Even Gate Enforce is on.").range(0.3, 1.0).step(0.01));
+        v.push(F::new(g, e, "momentum_break_even_gate_enforce", "Break-Even Gate Enforce", "bool", true,
+            "Off = observe: the break-even verdict is computed on every entry and every held spike and recorded on \
+             the entry's log line and its Viper Backtrace record (\"would veto\"), and nothing is refused. On = refuse \
+             a side whose plan needs a win rate above the Break-Even Cap. Start in observe and compare the verdicts \
+             with the trades that followed before enforcing."));
         v.push(F::new(g, e, "momentum_reversal_ratio", "Reversal Ratio", "decimal", true,
             "Fraction of the entry velocity threshold that, read against the position, counts as a reversal for the \
              in-position reversal exit. 0.75 means a 5s oracle move three-quarters the size of the one that triggered \

@@ -344,6 +344,8 @@ fn default_momentum_obi_exhaust_min_hold_secs()   -> i64     { config::MOMENTUM_
 fn default_momentum_obi_exhaust_persist_secs()    -> i64     { config::MOMENTUM_OBI_EXHAUST_PERSIST_SECS    }
 fn default_momentum_tp_fee_margin_mult()          -> Decimal { config::MOMENTUM_TP_FEE_MARGIN_MULT          }
 fn default_momentum_max_fee_to_target_ratio()     -> Decimal { config::MOMENTUM_MAX_FEE_TO_TARGET_RATIO     }
+fn default_momentum_max_break_even_win_rate()     -> Decimal { config::MOMENTUM_MAX_BREAK_EVEN_WIN_RATE      }
+fn default_momentum_break_even_gate_enforce()     -> bool    { config::MOMENTUM_BREAK_EVEN_GATE_ENFORCE      }
 fn default_momentum_reversal_ratio()              -> Decimal { config::MOMENTUM_REVERSAL_RATIO              }
 fn default_momentum_reversal_min_hold_secs()      -> i64     { config::MOMENTUM_MIN_HOLD_SECS_BEFORE_REVERSAL }
 fn default_momentum_reversal_persist_secs()       -> i64     { config::MOMENTUM_REVERSAL_PERSIST_SECS       }
@@ -594,6 +596,14 @@ pub struct DynamicConfig {
     /// this one declines the trade when the fee would dominate the plan.
     #[serde(default = "default_momentum_max_fee_to_target_ratio")]
     pub momentum_max_fee_to_target_ratio: Decimal,
+    /// Highest fee-adjusted break-even win rate the plan may need at an entry
+    /// price before the break-even gate refuses it, and whether the refusal is
+    /// enforced. Observe-first: with enforce off the verdict is recorded on
+    /// every entry and every held spike and nothing is refused.
+    #[serde(default = "default_momentum_max_break_even_win_rate")]
+    pub momentum_max_break_even_win_rate: Decimal,
+    #[serde(default = "default_momentum_break_even_gate_enforce")]
+    pub momentum_break_even_gate_enforce: bool,
     /// Fraction of the entry velocity threshold that, read in the opposite
     /// direction, counts as a reversal for the in-position reversal exit.
     #[serde(default = "default_momentum_reversal_ratio")]
@@ -1334,6 +1344,8 @@ impl Default for DynamicConfig {
             momentum_obi_exhaust_persist_secs:    config::MOMENTUM_OBI_EXHAUST_PERSIST_SECS,
             momentum_tp_fee_margin_mult:          config::MOMENTUM_TP_FEE_MARGIN_MULT,
             momentum_max_fee_to_target_ratio:     config::MOMENTUM_MAX_FEE_TO_TARGET_RATIO,
+            momentum_max_break_even_win_rate:     config::MOMENTUM_MAX_BREAK_EVEN_WIN_RATE,
+            momentum_break_even_gate_enforce:     config::MOMENTUM_BREAK_EVEN_GATE_ENFORCE,
             momentum_reversal_ratio:              config::MOMENTUM_REVERSAL_RATIO,
             momentum_reversal_min_hold_secs:      config::MOMENTUM_MIN_HOLD_SECS_BEFORE_REVERSAL,
             momentum_reversal_persist_secs:       config::MOMENTUM_REVERSAL_PERSIST_SECS,
@@ -2193,6 +2205,7 @@ mod tests {
         for added in [
             "fairvalue_stop_model_confirm_frac", "arb_settle_grace_secs", "fairvalue_settle_snipe_hold",
             "fairvalue_resting_tp_enabled", "momentum_resting_tp_enabled",
+            "momentum_max_break_even_win_rate", "momentum_break_even_gate_enforce",
             "fairvalue_settle_hold_secs", "fairvalue_settle_hold_min_prob",
             "fairvalue_bail_secs", "fairvalue_bail_prob", "fairvalue_min_exit_bid",
             "convergence_max_fee_to_target_ratio", "convergence_tp_fee_margin_mult", "convergence_resting_tp_enabled",
@@ -2242,6 +2255,8 @@ mod tests {
             serde_json::from_value(legacy).expect("an old persisted row must still deserialize");
 
         assert_eq!(cfg.momentum_resting_tp_enabled, config::MOMENTUM_RESTING_TP_ENABLED);
+        assert_eq!(cfg.momentum_max_break_even_win_rate, config::MOMENTUM_MAX_BREAK_EVEN_WIN_RATE);
+        assert_eq!(cfg.momentum_break_even_gate_enforce, config::MOMENTUM_BREAK_EVEN_GATE_ENFORCE);
         assert_eq!(cfg.momentum_catastrophic_persist_secs, config::MOMENTUM_CATASTROPHIC_PERSIST_SECS);
         assert_eq!(cfg.momentum_scaled_sizing_enabled, config::ENABLE_KELLY_SIZING);
         assert_eq!(cfg.gboost_planb_exit_posture, config::GBOOST_PLANB_EXIT_POSTURE);
