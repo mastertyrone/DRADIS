@@ -33,6 +33,7 @@ use std::sync::atomic::Ordering as AtomicOrdering;
 use alloy::primitives::{U256, Address, address};
 use alloy::providers::Provider;
 use chrono::Utc;
+use crate::squadron::game_over::{sports_game_over_due, sports_game_over_verdict, GameOver, SportsBook, SportsGameSignals};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use tokio::time::{interval, Instant, Duration};
@@ -385,6 +386,18 @@ impl Squadron {
         let mut venue_closed_since: Option<Instant> = None;
         // Last ghost-settlement pass, throttled to the venue-status cadence.
         let mut ghost_settle_probed_at: Option<Instant> = None;
+        // Game-over probe state for a single-market SPORTS squadron. The ledger
+        // lookups (kick-off, recorded resolution) run at the venue-status cadence
+        // and stop once answered; the board and the book are read every tick.
+        let mut sports_signals_probed_at = Instant::now()
+            .checked_sub(Duration::from_secs(EVENT_MARKET_STATUS_POLL_SECS))
+            .unwrap_or_else(Instant::now);
+        let mut sports_kick_off: Option<chrono::DateTime<Utc>> = None;
+        let mut sports_resolved = false;
+        // Since when the book has shown no level on either side.
+        let mut book_absent_since: Option<Instant> = None;
+        // Since when the game has continuously read as over.
+        let mut game_over_since: Option<Instant> = None;
 
         // Squadron's hourly market fields
         let hourly_yes_token         = self.market.yes_token.clone();
@@ -1055,10 +1068,83 @@ impl Squadron {
                             }
                         }
 
-                        if let Some(reason) = event_market_retire_reason(
+                        // ── Game-over probe (sports only) ───────────────────
+                        // The third retirement signal. The venue's "open" and
+                        // the stated close both fail on a finished Polymarket
+                        // game (see `sports_game_over_verdict`), so a sports
+                        // squadron also asks the board, the book and the
+                        // ledger's own records whether its game is over.
+                        let mut game_over_verdict: Option<GameOver> = None;
+                        let mut game_over_held = 0i64;
+                        let mut game_over_due = false;
+                        if market_class_for_ctx == "sports" {
+                            let yes = *yes_price_rx.borrow();
+                            let no = *no_price_rx.borrow();
+                            let has_book = crate::state::price_state::snapshot_has_book(&yes, &no);
+                            if has_book {
+                                book_absent_since = None;
+                            } else if book_absent_since.is_none() {
+                                book_absent_since = Some(Instant::now());
+                            }
+                            if sports_signals_probed_at.elapsed() >= Duration::from_secs(EVENT_MARKET_STATUS_POLL_SECS) {
+                                sports_signals_probed_at = Instant::now();
+                                // The ledger writes to the primary pool on every venue.
+                                if let Some(pool) = crate::helpers::db::pool() {
+                                    if sports_kick_off.is_none() {
+                                        sports_kick_off = crate::helpers::db::sports_ledger_kick_off(pool, &hourly_condition_id).await;
+                                    }
+                                    if !sports_resolved {
+                                        sports_resolved =
+                                            crate::helpers::db::sports_resolved_price(pool, hourly_yes_token.as_str()).await.is_some()
+                                            || crate::helpers::db::sports_resolved_price(pool, hourly_no_token.as_str()).await.is_some();
+                                    }
+                                }
+                            }
+                            let signals = SportsGameSignals {
+                                kick_off: sports_kick_off,
+                                on_board: crate::raptors::sports_ledger::line_for(
+                                    hourly_yes_token.as_str(), hourly_no_token.as_str()).is_some(),
+                                resolved_by_ledger: sports_resolved,
+                                book: if has_book {
+                                    SportsBook::Live { top_bid: yes.0.max(no.0) }
+                                } else {
+                                    SportsBook::Absent { for_secs: book_absent_since.map_or(0, |t| t.elapsed().as_secs() as i64) }
+                                },
+                            };
+                            let (after, decided) = {
+                                let dc = dynamic_config.read().unwrap();
+                                (dc.sports_game_over_after_secs, dc.sports_game_over_decided_bid)
+                            };
+                            game_over_verdict = sports_game_over_verdict(now, &signals, after, decided);
+                            match game_over_verdict {
+                                Some(v) => {
+                                    if game_over_since.is_none() {
+                                        game_over_since = Some(Instant::now());
+                                        info!(
+                                            "🏁 Squadron [{}] game \"{}\" reads as over: {} — retiring in {}s once flat (venue still reports it open)",
+                                            self.id, hourly_market_name, v.describe(),
+                                            if matches!(v, GameOver::Resolved) { 0 } else { grace },
+                                        );
+                                    }
+                                }
+                                None => {
+                                    if game_over_since.take().is_some() {
+                                        info!(
+                                            "🏁 Squadron [{}] game \"{}\" no longer reads as over — retirement clock reset",
+                                            self.id, hourly_market_name,
+                                        );
+                                    }
+                                }
+                            }
+                            game_over_held = game_over_since.map_or(0, |t| t.elapsed().as_secs() as i64);
+                            game_over_due = sports_game_over_due(game_over_verdict, game_over_held, grace, holding);
+                        }
+
+                        let retire = event_market_retire_reason(
                             true, hourly_market_close_time, now, grace, holding,
                             venue_accepting_orders, venue_closed_for,
-                        ) {
+                        ).or(if game_over_due { Some(RetireReason::GameOver) } else { None });
+                        if let Some(reason) = retire {
                             let why = match reason {
                                 RetireReason::PastClose => format!(
                                     "passed its stated close {}s ago",
@@ -1067,6 +1153,10 @@ impl Squadron {
                                 RetireReason::VenueClosed => format!(
                                     "stopped accepting orders {}s ago",
                                     venue_closed_for.unwrap_or(0),
+                                ),
+                                RetireReason::GameOver => format!(
+                                    "is over although the venue still reports it open ({})",
+                                    game_over_verdict.map(|v| v.describe()).unwrap_or_default(),
                                 ),
                             };
                             info!(
@@ -1103,8 +1193,9 @@ impl Squadron {
                         let closed_by_venue = venue_closed_for.is_some_and(|s| s >= grace);
                         let closed_by_clock = venue_accepting_orders != Some(true)
                             && hourly_market_close_time.is_some_and(|c| (now - c).num_seconds() >= grace);
+                        let over_by_game = game_over_verdict.is_some_and(|v| matches!(v, GameOver::Resolved) || game_over_held >= grace);
                         if holding
-                            && (closed_by_venue || closed_by_clock)
+                            && (closed_by_venue || closed_by_clock || over_by_game)
                             && retire_wait_logged_at.elapsed() >= Duration::from_secs(60)
                         {
                             let open_count = {
@@ -1114,7 +1205,9 @@ impl Squadron {
                             info!(
                                 "🕰️ Squadron [{}] market \"{}\" is closed ({}) — holding {} open position(s), staying up to exit or be settled before standing down",
                                 self.id, hourly_market_name,
-                                if closed_by_venue { "venue no longer accepts orders" } else { "past its stated close" },
+                                if closed_by_venue { "venue no longer accepts orders" }
+                                else if closed_by_clock { "past its stated close" }
+                                else { "game is over" },
                                 open_count,
                             );
                             retire_wait_logged_at = Instant::now();
@@ -3399,6 +3492,9 @@ pub(crate) enum RetireReason {
     /// The venue has reported the market not accepting orders for at least the
     /// grace.
     VenueClosed,
+    /// A sports market whose game is demonstrably over although the venue still
+    /// reports it open: see `sports_game_over_verdict`.
+    GameOver,
 }
 
 /// Should a single-market squadron stand itself down, and why?

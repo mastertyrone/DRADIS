@@ -987,6 +987,23 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
              its exits keep evaluating, and retires once it is flat. Crypto squadrons never reach \
              this path; this venue's own loop rotates them onto the next market instead.")
             .range(0.0, 86_400.0).step(30.0).unit("s"));
+        v.push(F::new(g, e, "sports_game_over_after_secs", "Sports Game Over After", "secs", true,
+            "Seconds after kick-off before a sports squadron may judge its game OVER and stand down on that \
+             alone, freeing the sports slot. The venue's open flag is not enough: Polymarket keeps a game \
+             market open until formal resolution, hours or days after the final, and dates its close a week \
+             out, so a finished game would otherwise hold the slot through the next slate (observed 2026-09-29: \
+             a baseball game 3h40m past first pitch, book at 0.999/0.001, venue still open). Past this many \
+             seconds, and only when the bookmaker board no longer carries a line for the game, the squadron \
+             retires once the book has been absent, or priced as decided (see Sports Game Over Bid), for the \
+             Event Market Retire Delay, or as soon as the Sports Raptor has recorded the venue's resolution. \
+             The clock is only a floor and the book is the judge past it: a live game with a two-sided book is \
+             never retired, whatever the clock says, so this sits near the length of an ordinary game rather \
+             than past the longest one.").min(0.0).step(600.0).unit("s"));
+        v.push(F::new(g, e, "sports_game_over_decided_bid", "Sports Game Over Bid", "price", true,
+            "Best bid on either side at or above which a sports book reads as decided once the game is past \
+             Sports Game Over After. A finished game leaves a residual bid on the winner near a dollar; a live \
+             game, even late, trades inside it. Raise toward 1.00 to wait for the book to go fully one-sided.")
+            .range(0.5, 1.0).step(0.005));
         v.push(F::new(g, e, "deploy_min_liquidity_usd", "Auto-Deploy Volume Floor", "usd", false,
             "Smallest 24-hour trading volume, in dollars, that an auto-deployed squadron may be \
              placed on. The seeder picks the busiest open market in its class; below this floor it \

@@ -224,7 +224,7 @@ fn json_string_list(v: Option<&Value>) -> Vec<String> {
     }
 }
 
-fn parse_time(s: &str) -> Option<DateTime<Utc>> {
+pub(crate) fn parse_time(s: &str) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(s)
         .map(|t| t.with_timezone(&Utc))
         .ok()

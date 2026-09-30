@@ -1586,6 +1586,21 @@ pub const DEPLOY_MIN_LIQUIDITY_USD: Decimal = dec!(500);
 /// exiting. A squadron still holding a position waits regardless of this
 /// value: it keeps patrolling so its exits evaluate, and retires once flat.
 pub const EVENT_MARKET_RETIRE_GRACE_SECS: i64 = 300;
+/// Seconds after kick-off before a sports squadron may judge its game OVER and
+/// retire on that alone. The venue's `open` flag is not enough: Polymarket keeps
+/// a game market open until formal resolution, hours or days after the final,
+/// and dates its close a week out, so neither existing retirement signal fires
+/// and the finished game holds the one sports slot through the next slate.
+/// Observed 2026-09-29: White Sox/Astros, 3h40m past first pitch, book at
+/// 0.999/0.001, venue still "open". The clock is only a floor: past it the BOOK
+/// is the judge, and a live two-sided book is never retired however long the
+/// game runs, so this is set near the length of an ordinary game rather than
+/// past the longest one. Three hours would have freed tonight's slot.
+pub const SPORTS_GAME_OVER_AFTER_SECS: i64 = 10_800;
+/// Best bid on either side at or above which a sports book reads as DECIDED.
+/// A finished game leaves a residual bid on the winner near a dollar; a live
+/// one, even late, trades inside it. Only consulted past the kick-off window.
+pub const SPORTS_GAME_OVER_DECIDED_BID: Decimal = dec!(0.99);
 
 /// Wrap USDC.e that settlement leaves in the trading Safe back into pUSD.
 ///

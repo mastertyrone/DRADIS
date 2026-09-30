@@ -119,6 +119,8 @@ export interface DynamicConfig {
   auto_deploy_politics:          boolean;
   auto_deploy_sports:            boolean;
   event_market_retire_grace_secs: number;
+  sports_game_over_after_secs?: number;
+  sports_game_over_decided_bid?: string;
   deploy_min_liquidity_usd: string;
   collateral_sweep_enabled:      boolean;
   collateral_sweep_min_usdc:     string;

@@ -935,6 +935,34 @@ impl Strategy for BooklineStrategy {
     /// thing that will ever fill or close these rows. Disabled means "stop
     /// quoting", never "stop looking after what is already out there".
     async fn evaluate_exit(&self, ctx: &StrategyContext) -> Result<StrategySignal> {
+        self.sweep_shadow(
+            ctx,
+            &crate::raptors::sports_ledger::board(),
+            crate::raptors::sports_ledger::board_ready(),
+        ).await
+    }
+
+    fn status(&self) -> StrategyStatus { StrategyStatus::Active }
+    fn name(&self) -> String { STRATEGY_NAME.to_string() }
+    fn venue(&self) -> &'static str { "Sports" }
+    fn risk_model(&self) -> &'static str {
+        "Maker-first: resting bid under the bookmaker consensus, hold to fee-free settlement (simulated)"
+    }
+    fn max_exposure(&self) -> Decimal { crate::config::BOOKLINE_MAX_EXPOSURE_USDC }
+}
+
+impl BooklineStrategy {
+    /// The exit sweep with its two process-wide inputs passed in: the published
+    /// board and whether it has spoken. `evaluate_exit` supplies the live values;
+    /// a test supplies its own, so the sweep can be driven against an unspoken
+    /// board without touching the process-wide channel other tests publish to.
+    /// A seam, not a behavior: everything the sweep decides is decided here.
+    async fn sweep_shadow(
+        &self,
+        ctx: &StrategyContext,
+        board: &crate::raptors::sports_ledger::SportsBoard,
+        board_ready: bool,
+    ) -> Result<StrategySignal> {
         let dc = &ctx.dynamic_config;
         if ctx.market_class.as_deref() != Some("sports") {
             return Ok(StrategySignal::NoSignal);
@@ -951,7 +979,6 @@ impl Strategy for BooklineStrategy {
             return Ok(StrategySignal::NoSignal);
         }
         let now = Utc::now();
-        let board = crate::raptors::sports_ledger::board();
 
         for row in live {
             let token = MarketId::new(&row.token_id);
@@ -1023,7 +1050,7 @@ impl Strategy for BooklineStrategy {
                 // way on 2026-09-29. Leave the row alone this tick; the board will
                 // have spoken by the next. A board that HAS spoken and lacks the
                 // line is the genuine refusal below, and still pulls.
-                if dc.bookline_enabled && line.is_none() && !crate::raptors::sports_ledger::board_ready() {
+                if dc.bookline_enabled && line.is_none() && !board_ready {
                     if crate::vipers::gate_log_permitted(STRATEGY_NAME, &ctx.crypto_filter, "board-unseeded", GATE_LOG_INTERVAL_SECS) {
                         info!("📖 Bookline hold [{}] {}: the bookmaker board has not been published yet — not a verdict on this market (simulated)",
                               row.market, row.side);
@@ -1108,14 +1135,167 @@ impl Strategy for BooklineStrategy {
         }
         Ok(StrategySignal::NoSignal)
     }
+}
 
-    fn status(&self) -> StrategyStatus { StrategyStatus::Active }
-    fn name(&self) -> String { STRATEGY_NAME.to_string() }
-    fn venue(&self) -> &'static str { "Sports" }
-    fn risk_model(&self) -> &'static str {
-        "Maker-first: resting bid under the bookmaker consensus, hold to fee-free settlement (simulated)"
+#[cfg(test)]
+mod shadow_sweep_tests {
+    //! The squadron lane's exit sweep against a real (in-memory) ledger, driven
+    //! through `sweep_shadow` so the board and its spoken-ness are the test's own
+    //! rather than the process-wide channel other tests publish to. That is what
+    //! makes these order-independent: nothing here reads `sports_ledger::board()`
+    //! or `board_ready()`, and the database is registered under an asset name no
+    //! other test uses.
+    use super::*;
+    use crate::helpers::db::{self, BOOKLINE_LANE_SQUADRON};
+    use crate::raptors::sports_ledger::{SportsBoard, SportsLine};
+    use crate::state::{MarketConfig, MarketSnapshot, PositionMap};
+    use rust_decimal_macros::dec;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    const ASSET: &str = "bookline-exit-test";
+    const CID: &str = "0xlynx";
+    const YES: &str = "lynx-yes";
+    const NO: &str = "lynx-no";
+
+    fn market() -> MarketConfig {
+        MarketConfig {
+            yes_token: MarketId::new(YES), no_token: MarketId::new(NO),
+            market_name: "wnba-min-nyl".to_string(),
+            market_close_time: Some(Utc::now() + chrono::Duration::hours(4)),
+            strike_price: None, is_neg_risk: false,
+            condition_id: CID.to_string(), yes_fee_bps: 0, no_fee_bps: 0,
+        }
     }
-    fn max_exposure(&self) -> Decimal { crate::config::BOOKLINE_MAX_EXPOSURE_USDC }
+
+    /// A book on the Lynx side: bid 0.58, ask 0.60. The ask is above the resting
+    /// bid, so nothing here fills; the tests are about pulls.
+    fn snap() -> MarketSnapshot {
+        MarketSnapshot {
+            yes_bid: dec!(0.58), yes_bid_depth: dec!(200),
+            yes_ask: dec!(0.60), yes_ask_depth: dec!(150),
+            no_bid: dec!(0.40), no_bid_depth: dec!(180),
+            no_ask: dec!(0.42), no_ask_depth: dec!(160),
+            yes_bid_depth_total: dec!(1200), yes_ask_depth_total: dec!(900),
+            no_bid_depth_total: dec!(1100), no_ask_depth_total: dec!(950),
+            oracle_price: dec!(0),
+            velocity: dec!(0), velocity_1s: dec!(0), acceleration: dec!(0),
+            funding_rate: dec!(0), oracle_drift_60m: dec!(0),
+            oracle_drift_10m: dec!(0), hist_vol: dec!(0),
+            institutional_pulse: dec!(0), tide_coherence: dec!(0),
+            tradfi_velocity: dec!(0), macro_coherence: dec!(0),
+            vix_proxy: dec!(0), vix_velocity: dec!(0),
+            oi_delta_pct: dec!(0), cvd_ratio: dec!(1),
+            secs_to_expiry: 3 * 3600, timestamp: Utc::now(),
+        }
+    }
+
+    fn ctx(enabled: bool) -> StrategyContext {
+        let mut dc = crate::helpers::dynamic_config::DynamicConfig::default();
+        dc.bookline_enabled = enabled;
+        StrategyContext {
+            market_class: Some("sports".to_string()),
+            squadron_id: "sports-open".to_string(),
+            market: market(),
+            snapshot: snap(),
+            positions: Arc::new(Mutex::new(PositionMap::new())),
+            session_pnl: dec!(0), starting_collateral: dec!(100),
+            available_collateral: dec!(100),
+            crypto_filter: ASSET.to_string(),
+            market_started_at: Utc::now(),
+            maker_market: None, maker_snapshot: None,
+            dynamic_config: Arc::new(dc),
+            arb_market_lockouts: None,
+            sports: None,
+        }
+    }
+
+    /// A board that has spoken and holds a fresh line for the Lynx.
+    fn board_with_line() -> SportsBoard {
+        let now = Utc::now();
+        let mut b = SportsBoard::new();
+        b.insert(YES.to_string(), SportsLine {
+            league: "wnba".into(), sport_key: "basketball_wnba".into(), odds_event_id: "ev".into(),
+            commence: now + chrono::Duration::hours(3), outcome_label: "Minnesota Lynx".into(),
+            consensus: 0.5921, num_books: 10, dispersion: Some(0.022), max_book_age_secs: Some(60),
+            odds_at: now, drift: None, drift_secs: None,
+        });
+        b
+    }
+
+    async fn rest_a_bid(pool: &sqlx::SqlitePool) {
+        assert!(db::bookline_shadow_quote(
+            pool, BOOKLINE_LANE_SQUADRON, ASSET, CID, YES, "wnba-min-nyl", "YES",
+            Some("wnba"), None, 0.58, 17.24, 0.5921, 0.01, 10, Some(0.022),
+        ).await);
+    }
+
+    async fn open(pool: &sqlx::SqlitePool) -> Vec<db::BooklineShadow> {
+        db::bookline_shadow_open(pool, BOOKLINE_LANE_SQUADRON, ASSET).await
+    }
+
+    async fn last_exit_reason(pool: &sqlx::SqlitePool) -> Option<String> {
+        sqlx::query_scalar("SELECT exit_reason FROM bookline_shadow WHERE asset = ? ORDER BY id DESC LIMIT 1")
+            .bind(ASSET).fetch_one(pool).await.unwrap()
+    }
+
+    /// The restart of 2026-09-29, on the squadron lane: a resting bid, then a
+    /// sweep against the board as it is before the ledger's first tick (empty and
+    /// unspoken). Not a verdict: the bid must still be resting. Then the same
+    /// empty board once it HAS spoken: the genuine refusal, and it pulls.
+    #[tokio::test]
+    async fn an_unspoken_board_leaves_the_squadron_bid_resting_and_a_spoken_one_pulls_it() {
+        let pool = db::memory_pool_for_tests().await;
+        db::run_migrations(&pool).await;
+        db::register_pool_for_tests(ASSET, &pool);
+        let viper = BooklineStrategy::new();
+        let ctx = ctx(true);
+
+        rest_a_bid(&pool).await;
+        assert_eq!(open(&pool).await.len(), 1);
+
+        // Positive control: the sweep runs and leaves a healthy bid alone on a
+        // board that holds its line. Proves the fixture reaches the resting path.
+        viper.sweep_shadow(&ctx, &board_with_line(), true).await.unwrap();
+        assert_eq!(open(&pool).await.len(), 1, "a fresh line with the ask above the bid rests");
+
+        // The hole: empty board, not yet spoken. Must not pull.
+        viper.sweep_shadow(&ctx, &SportsBoard::new(), false).await.unwrap();
+        assert_eq!(open(&pool).await.len(), 1, "an unpublished board is not a refusal");
+
+        // The same empty board, spoken: the ledger no longer holds the market.
+        viper.sweep_shadow(&ctx, &SportsBoard::new(), true).await.unwrap();
+        assert!(open(&pool).await.is_empty(), "a withdrawn line still pulls");
+        assert_eq!(
+            last_exit_reason(&pool).await.as_deref(),
+            Some("pulled: no bookmaker line for this market"),
+        );
+    }
+
+    /// The operator's switch is not a board verdict: off pulls even before the
+    /// board has spoken, so a disabled viper never leaves a bid resting on nothing.
+    #[tokio::test]
+    async fn the_switch_pulls_even_before_the_board_has_spoken() {
+        let pool = db::memory_pool_for_tests().await;
+        db::run_migrations(&pool).await;
+        // Its own registry key: the pool registry is process-wide.
+        let asset = format!("{ASSET}-off");
+        db::register_pool_for_tests(&asset, &pool);
+        let viper = BooklineStrategy::new();
+        let mut ctx = ctx(false);
+        ctx.crypto_filter = asset.clone();
+
+        assert!(db::bookline_shadow_quote(
+            &pool, BOOKLINE_LANE_SQUADRON, &asset, CID, YES, "wnba-min-nyl", "YES",
+            Some("wnba"), None, 0.58, 17.24, 0.5921, 0.01, 10, Some(0.022),
+        ).await);
+        viper.sweep_shadow(&ctx, &SportsBoard::new(), false).await.unwrap();
+        assert!(db::bookline_shadow_open(&pool, BOOKLINE_LANE_SQUADRON, &asset).await.is_empty());
+        let reason: Option<String> = sqlx::query_scalar(
+            "SELECT exit_reason FROM bookline_shadow WHERE asset = ? ORDER BY id DESC LIMIT 1")
+            .bind(&asset).fetch_one(&pool).await.unwrap();
+        assert_eq!(reason.as_deref(), Some("pulled: Bookline disabled"));
+    }
 }
 
 #[cfg(test)]

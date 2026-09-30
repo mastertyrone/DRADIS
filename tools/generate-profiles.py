@@ -101,15 +101,25 @@ def const_values(path: Path) -> dict[str, object]:
 # research data is being collected, and settings tied to the operator's own
 # Odds API account (its quota reset day, the credits to hold back). Applying a
 # profile must not switch collection off or reset the account settings.
+# Bookline's board lane is a measurement lane off that ledger (it never reaches
+# a venue), so its switch, its sanity bound and its own copies of the Bookline
+# parameters are operational too: what an operator is trying against the whole
+# board is not risk appetite. Every `bookline_board_*` field is excluded, the
+# same rule `embedded_profiles_match_config_schema` enforces on the output.
 NON_PROFILE_FIELDS = {
     "ghost_mode", "collateral_sweep_enabled",
     "sports_ledger_enabled", "sports_ledger_leagues", "sports_ledger_snapshot_offsets_mins",
     "sports_ledger_credit_reserve", "sports_ledger_quota_reset_day",
 }
+NON_PROFILE_PREFIXES = ("bookline_board_",)
+
+
+def is_profile_field(name: str) -> bool:
+    return name not in NON_PROFILE_FIELDS and not name.startswith(NON_PROFILE_PREFIXES)
 
 
 def main() -> None:
-    mapping = {f: c for f, c in field_const_map().items() if f not in NON_PROFILE_FIELDS}
+    mapping = {f: c for f, c in field_const_map().items() if is_profile_field(f)}
     result = {"schema_version": 1, "profiles": {}}
     missing_report: list[str] = []
 

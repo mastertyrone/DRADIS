@@ -294,6 +294,8 @@ fn default_auto_deploy_politics()           -> bool    { config::AUTO_DEPLOY_POL
 fn default_auto_deploy_sports()             -> bool    { config::AUTO_DEPLOY_SPORTS                   }
 fn default_kalshi_sports_game_series()      -> String  { config::KALSHI_SPORTS_GAME_SERIES.to_string() }
 fn default_event_market_retire_grace_secs() -> i64     { config::EVENT_MARKET_RETIRE_GRACE_SECS       }
+fn default_sports_game_over_after_secs() -> i64 { config::SPORTS_GAME_OVER_AFTER_SECS }
+fn default_sports_game_over_decided_bid() -> Decimal { config::SPORTS_GAME_OVER_DECIDED_BID }
 fn default_deploy_min_liquidity_usd()  -> Decimal { config::DEPLOY_MIN_LIQUIDITY_USD        }
 fn default_collateral_sweep_enabled()       -> bool    { config::COLLATERAL_SWEEP_ENABLED             }
 fn default_collateral_sweep_min_usdc()      -> Decimal { config::COLLATERAL_SWEEP_MIN_USDC            }
@@ -660,6 +662,13 @@ pub struct DynamicConfig {
     /// flat.
     #[serde(default = "default_event_market_retire_grace_secs")]
     pub event_market_retire_grace_secs: i64,
+    /// Seconds after kick-off before a sports squadron may judge its game over
+    /// from the board and the book; see `SPORTS_GAME_OVER_AFTER_SECS`.
+    #[serde(default = "default_sports_game_over_after_secs")]
+    pub sports_game_over_after_secs: i64,
+    /// Best bid on either side at or above which a sports book reads as decided.
+    #[serde(default = "default_sports_game_over_decided_bid")]
+    pub sports_game_over_decided_bid: Decimal,
     /// Smallest 24h volume, in dollars, an auto-deploy may settle on. Below it
     /// the class stays empty until the next tick finds something better.
     #[serde(default = "default_deploy_min_liquidity_usd")]
@@ -1351,6 +1360,8 @@ impl Default for DynamicConfig {
             auto_deploy_sports:            config::AUTO_DEPLOY_SPORTS,
             kalshi_sports_game_series:     config::KALSHI_SPORTS_GAME_SERIES.to_string(),
             event_market_retire_grace_secs: config::EVENT_MARKET_RETIRE_GRACE_SECS,
+            sports_game_over_after_secs: config::SPORTS_GAME_OVER_AFTER_SECS,
+            sports_game_over_decided_bid: config::SPORTS_GAME_OVER_DECIDED_BID,
             deploy_min_liquidity_usd: config::DEPLOY_MIN_LIQUIDITY_USD,
             collateral_sweep_enabled:      config::COLLATERAL_SWEEP_ENABLED,
             collateral_sweep_min_usdc:     config::COLLATERAL_SWEEP_MIN_USDC,

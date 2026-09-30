@@ -51,6 +51,9 @@ pub use context::PatrolContext;
 
 /// Inner tick-loop implementation for `Squadron::patrol()`.
 /// Kept in a separate file to avoid bloating mod.rs.
+/// The sports game-over rule. Unconditional: the rule is venue-neutral and its
+/// tests run on every venue; only its wiring lives in the intl patrol.
+pub mod game_over;
 #[cfg(feature = "intl_clob")]
 mod patrol_impl;
 /// Bulk order cancellation, shared by the three paths that end a squadron's

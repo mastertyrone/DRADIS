@@ -1200,6 +1200,21 @@ pub async fn sports_ledger_rows_for_token_since(pool: &SqlitePool, token_id: &st
         .unwrap_or_else(|e| { error!("❌ DB sports ledger replay read failed: {}", e); Vec::new() })
 }
 
+/// Kick-off for a market the sports ledger has matched, or `None` if it never
+/// has. The ledger is the only place the engine knows a game's start: the
+/// venue's close time is a week after the game on MLB, and the board drops the
+/// line once the game is under way, so a squadron judging whether its game is
+/// over has to ask the rows. `MAX` because a rematch of the fixture in the
+/// ledger's window should never resolve to an older date.
+pub async fn sports_ledger_kick_off(pool: &SqlitePool, condition_id: &str) -> Option<DateTime<Utc>> {
+    let s: Option<String> = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT MAX(commence) FROM sports_line_ledger WHERE condition_id = ?")
+        .bind(condition_id)
+        .fetch_one(pool).await
+        .unwrap_or_else(|e| { error!("❌ DB sports ledger kick-off read failed: {}", e); None });
+    s.as_deref().and_then(crate::raptors::sports_ledger::parse_time)
+}
+
 /// The venue's own resolution for a token, as the sports ledger recorded it.
 ///
 /// Settlement is the plan for every Bookline position, so this is the primary exit
@@ -3102,6 +3117,15 @@ pub(crate) async fn memory_pool_for_tests() -> SqlitePool {
         .unwrap();
     init_schema(&pool).await.unwrap();
     pool
+}
+
+/// Make `pool_for(asset)` answer with `pool`, for tests outside this module that
+/// drive a code path resolving its database from a `StrategyContext`'s shard.
+/// Tests must pick an asset name of their own so they cannot see each other's
+/// tables; the registry is process-wide.
+#[cfg(test)]
+pub(crate) fn register_pool_for_tests(asset: &str, pool: &SqlitePool) {
+    pools_map().lock().unwrap().insert(asset.to_lowercase(), pool.clone());
 }
 
 /// Read back the entry fee recorded for an open position, if any.
