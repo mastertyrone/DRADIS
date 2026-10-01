@@ -122,6 +122,7 @@ const MANAGED_KEYS: &[(&str, &str, &str, &str, &str)] = &[
     ("ALPACA_API_SECRET_KEY",    "Alpaca API secret key",         "shared", "raptor", "text"),
     ("ODDS_API_KEY",             "The Odds API key",              "shared", "raptor", "text"),
     ("LIVETENNIS_API_KEY",       "Live Tennis API key",           "shared", "raptor", "text"),
+    ("X402_WALLET_KEY",          "x402 wallet key (Kalshi–PredictIt Arb, paid)", "shared", "raptor", "text"),
     ("TELEGRAM_BOT_TOKEN",       "Telegram bot token",            "shared", "integration", "text"),
     ("TELEGRAM_CHAT_ID",         "Telegram chat ID",              "shared", "integration", "text"),
     ("LLM_PROVIDER",             "LLM provider (ollama | openai | anthropic)", "shared", "integration", "text"),
@@ -268,6 +269,14 @@ const RAPTOR_SOURCES: &[RaptorSource] = &[
         poll_field: Some("tennis_poll_secs"), free_quota: Some((100, "day")),
         selector_fields: &["tennis_tour"],
         settings_group: Some("Tennis Raptor"),
+        region_note: None,
+    },
+    RaptorSource {
+        id: "kalshi_predictit_arb", name: "Kalshi–PredictIt Arb Raptor", source: "kalshi-predictit-arb (Team Takatini, paid via x402)",
+        blurb: "Kalshi↔PredictIt cross-venue gaps, worst-case net after both venues' fees. Signal-only — no Viper reads it — and not spawned by default (see src/raptors/kalshi_predictit_arb.rs). Paid third-party feed: $0.02 USDC per call on Base via x402, no free tier. Without a key it runs an offline demo on fictional sample data at no cost. The hourly default poll is $0.48/day, under a $0.50/day cap. There is no key to sign up for: X402_WALLET_KEY is the private key of a Base wallet you create and fund yourself (use a dedicated low-balance one); the link below is the feed's setup docs.",
+        tier: "optional", keys: &["X402_WALLET_KEY"],
+        test_kind: None, signup_url: Some("https://mastertyrone.github.io/kalshi-predictit-arb/"),
+        poll_field: None, free_quota: None, selector_fields: &[], settings_group: None,
         region_note: None,
     },
 ];
