@@ -32,6 +32,7 @@
 ///
 /// │ Sports Raptor   │ The Odds API (h2h)   │ line drift, consensus prob, book spread  │
 /// │ Tennis Raptor   │ Live Tennis API      │ live score, server, break-point state    │
+/// │ K–PI Arb Raptor │ kalshi-predictit-arb │ Kalshi↔PredictIt worst-case net after fee│
 ///
 /// Future Raptors (not yet implemented)
 /// ─────────────────────────────────────
@@ -42,6 +43,10 @@
 /// pipelines) and, like the Tide Raptor, run observe-only: they publish telemetry
 /// but no Viper consumes them for sizing yet.
 ///
+/// The Kalshi–PredictIt Arb Raptor is an optional, observe-only third-party feed
+/// (paid via x402 in live mode, offline demo otherwise). It is not spawned by
+/// `main.rs`; see `kalshi_predictit_arb.rs`.
+///
 /// When multiple Raptors are active the GBoost and Basis strategies fuse their
 /// signals as features — no single Raptor has veto power alone.
 pub mod price;
@@ -51,3 +56,4 @@ pub mod tide;
 pub mod sports_ledger;
 pub mod tennis;
 pub mod horizon;
+pub mod kalshi_predictit_arb;
