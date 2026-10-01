@@ -18,6 +18,9 @@ default   = ["intl_clob"]
 intl_clob = ["dep:polymarket_client_sdk_v2", "dep:alloy"]
 us_retail = ["dep:polymarket-us"]
 kalshi    = ["dep:rsa"]
+# Not a venue: lets `us_retail` / `kalshi` builds sign x402 payments for the
+# optional Kalshi–PredictIt Arb Raptor (`intl_clob` already carries alloy).
+x402      = ["dep:alloy"]
 
 [dependencies]
 polymarket_client_sdk_v2 = { version = "0.7.0", optional = true, features = ["clob", "ws", "data", "ctf"] }
