@@ -988,6 +988,44 @@ pub const TENNIS_SCORE_STALENESS_SECS: u64 = 600;
 /// Warn when the API's X-RateLimit remaining-request count drops to this.
 pub const TENNIS_LOW_BUDGET_WARN: i64 = 20;
 
+// ── Kalshi–PredictIt Arb Raptor (third-party kalshi-predictit-arb feed, x402) ─
+//
+// Optional, signal-only and NOT spawned by default (see
+// src/raptors/kalshi_predictit_arb.rs). Paid third-party feed operated by Team
+// Takatini: $0.02 USDC per call on Base via x402, no free tier. Without a key the
+// raptor runs an offline demo on fictional sample data at no cost.
+//
+/// Env var carrying the x402 wallet key. Absent/empty ⇒ offline demo: one
+/// snapshot from the bundled fictional fixture (`sample_data = true`,
+/// `connected = false`), no network, no cost. Use a dedicated low-balance wallet.
+pub const KALSHI_PREDICTIT_ARB_WALLET_KEY_ENV: &str = "X402_WALLET_KEY";
+
+/// Keyword filter passed to the feed (`governor`, `senate`, a state, a Kalshi
+/// ticker fragment). Empty ⇒ every matched pair.
+pub const KALSHI_PREDICTIT_ARB_Q: &str = "";
+
+/// Pairs evaluated per call (the feed clamps to 1–25).
+pub const KALSHI_PREDICTIT_ARB_LIMIT: u32 = 10;
+
+/// false ⇒ only executable pairs (≥ 1¢ worst-case net after fees);
+/// true ⇒ every evaluated pair, including negative ones.
+pub const KALSHI_PREDICTIT_ARB_ALL_PAIRS: bool = false;
+
+/// Seconds between LIVE polls (floor 60). Honest budget note — every live poll
+/// costs $0.02: the 3600s default is 24 calls = $0.48/day, inside the default
+/// daily budget; 900s would be ~$1.92/day and is refused by that budget after
+/// 25 calls.
+pub const KALSHI_PREDICTIT_ARB_POLL_SECS: u64 = 3600;
+
+/// Refuse any single x402 payment above this (USD).
+pub const KALSHI_PREDICTIT_ARB_MAX_USD_PER_CALL: Decimal = dec!(0.02);
+
+/// Refuse payments once this much was spent in the current UTC day (USD).
+pub const KALSHI_PREDICTIT_ARB_DAILY_BUDGET_USD: Decimal = dec!(0.50);
+
+/// HTTP timeout (seconds); the feed can cold-start slowly.
+pub const KALSHI_PREDICTIT_ARB_TIMEOUT_SECS: u64 = 30;
+
 
 // ============================================================================
 // BASIS STRATEGY MAKER ORDER PARAMETERS
